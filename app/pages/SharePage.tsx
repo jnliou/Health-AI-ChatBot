@@ -7,19 +7,78 @@ import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card'
 import { generateAccessCode } from '../data/mockData';
 import { toast } from 'sonner';
 import { Toaster } from '../components/ui/sonner';
+import { PatientSummaryData } from '../types/patientSummary';
+import { upsertSharedSummaryRecord } from '../utils/sharedSummaryRegistry';
+
+const ACCESS_CODE_STORAGE_KEY = 'sia_access_code_v1';
+const ACCESS_CODE_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 days
+const SUMMARY_STORAGE_KEY = 'sia_patient_summary_v1';
+
+interface StoredAccessCode {
+  code: string;
+  expiresAtISO: string;
+}
 
 export function SharePage() {
   const navigate = useNavigate();
   const [accessCode, setAccessCode] = useState('');
   const [copied, setCopied] = useState(false);
+  const [expiresAtISO, setExpiresAtISO] = useState<string | null>(null);
+  const [hasSummary, setHasSummary] = useState(false);
 
   useEffect(() => {
-    setAccessCode(generateAccessCode());
+    try {
+      const raw = localStorage.getItem(ACCESS_CODE_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<StoredAccessCode>;
+        const expiryMs = parsed.expiresAtISO ? Date.parse(parsed.expiresAtISO) : Number.NaN;
+        if (
+          typeof parsed.code === 'string' &&
+          parsed.code.length === 6 &&
+          !Number.isNaN(expiryMs) &&
+          Date.now() < expiryMs
+        ) {
+          try {
+            const summaryRaw = sessionStorage.getItem(SUMMARY_STORAGE_KEY);
+            if (summaryRaw) {
+              const summary = JSON.parse(summaryRaw) as PatientSummaryData;
+              upsertSharedSummaryRecord(parsed.code, parsed.expiresAtISO as string, summary);
+              setHasSummary(true);
+            }
+          } catch {
+            // Ignore malformed local/session data.
+          }
+          setAccessCode(parsed.code);
+          setExpiresAtISO(parsed.expiresAtISO as string);
+          return;
+        }
+      }
+    } catch {
+      // Ignore malformed storage and generate a fresh code.
+    }
+
+    const code = generateAccessCode();
+    const expiresAtISOValue = new Date(Date.now() + ACCESS_CODE_TTL_MS).toISOString();
+    const payload: StoredAccessCode = { code, expiresAtISO: expiresAtISOValue };
+    localStorage.setItem(ACCESS_CODE_STORAGE_KEY, JSON.stringify(payload));
+    try {
+      const summaryRaw = sessionStorage.getItem(SUMMARY_STORAGE_KEY);
+      if (summaryRaw) {
+        const summary = JSON.parse(summaryRaw) as PatientSummaryData;
+        upsertSharedSummaryRecord(code, expiresAtISOValue, summary);
+        setHasSummary(true);
+      }
+    } catch {
+      // Ignore malformed local/session data.
+    }
+    setAccessCode(code);
+    setExpiresAtISO(expiresAtISOValue);
   }, []);
 
-  const shareUrl = `https://sia.bccdc.ca/view/${accessCode}`;
+  const shareUrl = `${window.location.origin}/view/${accessCode}`;
 
   const handleCopy = () => {
+    if (!accessCode) return;
     navigator.clipboard.writeText(accessCode);
     setCopied(true);
     toast.success('Access code copied to clipboard');
@@ -82,6 +141,14 @@ export function SharePage() {
           </CardContent>
         </Card>
 
+        {!hasSummary && (
+          <Card className="border-amber-300 bg-amber-50 dark:bg-amber-900/20">
+            <CardContent className="pt-6 text-sm text-amber-900 dark:text-amber-100">
+              No patient summary found in this session yet. Create or open a summary note first, then return here to share it with providers.
+            </CardContent>
+          </Card>
+        )}
+
         {/* QR Code */}
         <Card>
           <CardHeader>
@@ -115,6 +182,11 @@ export function SharePage() {
               <p className="text-xs text-gray-500 dark:text-gray-400">
                 6-character access code
               </p>
+              {expiresAtISO && (
+                <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                  Expires {new Date(expiresAtISO).toLocaleDateString('en-CA')}
+                </p>
+              )}
             </div>
 
             <div className="grid grid-cols-2 gap-3">

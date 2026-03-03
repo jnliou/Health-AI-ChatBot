@@ -15,6 +15,7 @@ interface StoredTriageDraft {
   hasSymptoms: string | null;
   selectedSymptoms: string[];
   duration: string;
+  contactDate?: string;
   condomUse?: 'used throughout' | 'used sometimes' | 'no condom' | 'condom broke';
   partnerKnownSti?: 'yes' | 'no' | 'unsure';
   sexTypes?: string[];
@@ -55,7 +56,9 @@ export function PatientSummaryForm({ onSubmit, onCancel, initialData }: PatientS
 
   useEffect(() => {
     try {
-      const raw = localStorage.getItem('sia_triage_draft_v1');
+      const raw =
+        sessionStorage.getItem('sia_triage_draft_v1') ||
+        localStorage.getItem('sia_triage_draft_v1');
       if (!raw) return;
       const draft = JSON.parse(raw) as StoredTriageDraft;
       if (!draft) return;
@@ -71,6 +74,7 @@ export function PatientSummaryForm({ onSubmit, onCancel, initialData }: PatientS
           prev.what_happened ||
           draft.whatHappened ||
           (rememberedSymptoms ? `Symptoms reported in chat: ${rememberedSymptoms}` : prev.what_happened),
+        contact_date: prev.contact_date || draft.contactDate || prev.contact_date,
         sex_types:
           prev.sex_types.length > 0
             ? prev.sex_types
@@ -111,7 +115,7 @@ export function PatientSummaryForm({ onSubmit, onCancel, initialData }: PatientS
   };
 
   return (
-    <div className="bg-white dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-6 max-w-2xl mx-auto">
+    <div className="bg-white dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-6 max-w-2xl mx-auto max-h-[85vh] overflow-y-auto">
       <div className="mb-6">
         <h3 className="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-2">
           Create Patient Summary
@@ -131,9 +135,10 @@ export function PatientSummaryForm({ onSubmit, onCancel, initialData }: PatientS
             id="what_happened"
             value={formData.what_happened}
             onChange={(e) => setFormData({ ...formData, what_happened: e.target.value })}
-            className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-[#003366] dark:focus:ring-[#00A3A3] focus:border-transparent"
-            rows={3}
+            className="w-full min-h-[120px] max-h-[280px] overflow-y-auto resize-y px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-[#003366] dark:focus:ring-[#00A3A3] focus:border-transparent"
+            rows={5}
             placeholder="e.g., Had sex with new partner, condom broke"
+            autoFocus
             required
           />
         </div>

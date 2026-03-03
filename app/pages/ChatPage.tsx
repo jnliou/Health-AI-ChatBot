@@ -34,6 +34,16 @@ type Intent =
   | 'none';
 
 type TriagePath = 'needs_clinic' | 'ok_for_gco' | 'clarifying';
+type TriageStage =
+  | 'idle'
+  | 'symptomCheck'
+  | 'symptomDetails'
+  | 'symptomDuration'
+  | 'contactDate'
+  | 'sexTypes'
+  | 'condomUse'
+  | 'partnerKnownSti'
+  | 'whatHappened';
 
 interface ConversationContext {
   detectedIntents: Intent[];
@@ -52,6 +62,7 @@ interface StoredTriageDraft {
   hasSymptoms: 'yes' | 'no' | 'unsure' | null;
   selectedSymptoms: string[];
   duration: string;
+  contactDate?: string;
   condomUse?: 'used throughout' | 'used sometimes' | 'no condom' | 'condom broke';
   partnerKnownSti?: 'yes' | 'no' | 'unsure';
   sexTypes?: string[];
@@ -162,9 +173,13 @@ const INITIAL_MESSAGE: ChatMessage = {
 const SUMMARY_STORAGE_KEY = 'sia_patient_summary_v1';
 const SUMMARY_FORM_STORAGE_KEY = 'sia_patient_summary_form_v1';
 const TRIAGE_DRAFT_STORAGE_KEY = 'sia_triage_draft_v1';
+const CHAT_HISTORY_STORAGE_KEY = 'sia_chat_history_v1';
+const ACCESS_CODE_STORAGE_KEY = 'sia_access_code_v1';
 const USER_NAME_STORAGE_KEY = 'sia_user_name_v1';
 const USER_AGE_STORAGE_KEY = 'sia_user_age_v1';
 const RAG_BACKGROUND_REFRESH_MS = 1000 * 60 * 30; // 30 minutes
+const MANDATORY_BIRTH_CONTROL_DISCLAIMER =
+  'Hormonal birth control and LARCs (like IUDs) do not protect against STIs. Use condoms for dual protection.';
 const SUPPORTED_SUMMARY_LANGUAGES = [
   'English',
   'Arabic',
@@ -208,7 +223,7 @@ interface LlmTriageExtraction {
 async function getLLMGeneralResponse(
   query: string,
   context?: {
-    triageStage: 'idle' | 'symptomCheck' | 'symptomDetails' | 'symptomDuration';
+    triageStage: TriageStage;
     fallbackContent?: string;
     ragContextText?: string;
     userName?: string | null;
@@ -222,6 +237,17 @@ async function getLLMGeneralResponse(
 
   try {
     const triageMode = context?.triageStage && context.triageStage !== 'idle';
+    const lowerQuery = query.toLowerCase();
+    const contraceptionFocused =
+      lowerQuery.includes('birth control') ||
+      lowerQuery.includes('contraception') ||
+      lowerQuery.includes('plan b') ||
+      lowerQuery.includes('iud') ||
+      lowerQuery.includes('pill') ||
+      lowerQuery.includes('depo') ||
+      lowerQuery.includes('shot') ||
+      lowerQuery.includes('emergency contraception') ||
+      lowerQuery.includes('condom');
     const response = await fetch('/ollama/api/chat', {
       method: 'POST',
       signal: controller.signal,
@@ -258,6 +284,9 @@ async function getLLMGeneralResponse(
                 : '') +
               (context?.ragContextText
                 ? 'You are given retrieved reference snippets. Base your answer on those snippets first, then general knowledge only if needed. Do not copy long passages verbatim. Ignore unrelated/noisy lines.'
+                : '') +
+              (contraceptionFocused
+                ? 'For birth control answers, explicitly distinguish typical use vs perfect use effectiveness. Always append this exact warning: "Hormonal birth control and LARCs (like IUDs) do not protect against STIs. Use condoms for dual protection." If method failure is mentioned, prioritize emergency contraception options (emergency contraceptive pills and copper IUD) and note time sensitivity up to 5 to 7 days depending on method. Keep the tone supportive, clinical, and non-judgmental. '
                 : '') +
               (triageMode
                 ? 'The user is in a structured triage flow. Keep the same intent as the reference triage prompt, do not change decision logic, and keep any yes/no/not sure choices.'
@@ -308,8 +337,12 @@ async function getLLMGeneralResponse(
 }
 
 function normalizeLlmReply(reply: string): string {
-  const text = reply.trim();
+  let text = reply.trim();
   if (!text) return text;
+
+  // Remove leaked internal instruction lines.
+  text = text.replace(/^Always append this exact warning to birth control answers:.*$/gim, '').trim();
+  text = text.replace(/^Always append this exact warning:.*$/gim, '').trim();
 
   // If model outputs multiple greeting alternatives as bullets, keep first useful line.
   const lines = text
@@ -330,8 +363,94 @@ function normalizeLlmReply(reply: string): string {
   return text;
 }
 
+function isPriorityStiConcernQuery(query: string): boolean {
+  const lower = query.toLowerCase();
+  const concernWords = ['worried', 'concerned', 'anxious', 'scared', 'afraid', 'think', 'might', 'maybe'];
+  const hasConcern = concernWords.some((w) => lower.includes(w));
+  const hasStiTerm =
+    lower.includes('sti') || lower.includes('std') || lower.includes('infection') || lower.includes('sexual infection');
+  const hasSelfReference =
+    lower.includes('i have') ||
+    lower.includes("i've got") ||
+    lower.includes('i got') ||
+    lower.includes('do i have') ||
+    lower.includes('could i have');
+
+  return hasConcern && hasStiTerm && hasSelfReference;
+}
+
+function isContraceptionFocusedQuery(query: string): boolean {
+  const lower = query.toLowerCase();
+  return (
+    lower.includes('birth control') ||
+    lower.includes('contraception') ||
+    lower.includes('contraceptive') ||
+    lower.includes('iud') ||
+    lower.includes('pill') ||
+    lower.includes('implant') ||
+    lower.includes('patch') ||
+    lower.includes('ring') ||
+    lower.includes('depo') ||
+    lower.includes('shot') ||
+    lower.includes('plan b') ||
+    lower.includes('emergency contraception')
+  );
+}
+
+function postProcessAssistantContent(query: string, content: string): string {
+  let out = normalizeLlmReply(content);
+  if (!out) return out;
+
+  if (isContraceptionFocusedQuery(query)) {
+    // Remove partial disclaimer variants and ensure exact mandatory sentence once.
+    out = out
+      .replace(/Hormonal birth control and LARCs \(like IUDs\) do not protect against STIs\.(?! Use condoms for dual protection\.)/gi, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    if (!out.includes(MANDATORY_BIRTH_CONTROL_DISCLAIMER)) {
+      out = `${out}\n\n${MANDATORY_BIRTH_CONTROL_DISCLAIMER}`.trim();
+    }
+  }
+
+  return out;
+}
+
+function normalizeResponseSources(sources: { label: string; url: string }[]): { label: string; url: string }[] {
+  const cleaned = sources.filter(
+    (s) =>
+      !!s &&
+      typeof s.label === 'string' &&
+      typeof s.url === 'string' &&
+      s.label.trim().length > 0 &&
+      /^https?:\/\//i.test(s.url) &&
+      !/safety directives/i.test(s.label)
+  );
+  return Array.from(new Map(cleaned.map((s) => [s.url, { label: s.label.trim(), url: s.url.trim() }])).values());
+}
+
 function buildResourceFallbackAnswer(query: string, chunks: RagChunk[]): string | null {
   if (chunks.length === 0) return null;
+  const lowerQuery = query.toLowerCase();
+  const asksWhatIsBirthControl =
+    (lowerQuery.includes('what') && lowerQuery.includes('birth control')) ||
+    lowerQuery.includes('what is contraception');
+  const asksNeedBirthControl =
+    (lowerQuery.includes('do i need') && lowerQuery.includes('birth control')) ||
+    (lowerQuery.includes('should i use') && lowerQuery.includes('birth control'));
+  const emergencyQuery =
+    lowerQuery.includes('emergency') ||
+    lowerQuery.includes('plan b') ||
+    lowerQuery.includes('condom broke') ||
+    lowerQuery.includes('missed pill') ||
+    lowerQuery.includes('failed');
+
+  if (asksWhatIsBirthControl || asksNeedBirthControl) {
+    return (
+      'Birth control (contraception) means methods used to reduce the chance of pregnancy. ' +
+      'Whether you need it depends on your goals: if you want to avoid pregnancy and are having vaginal sex, using birth control is recommended.\n\n' +
+      'Most birth control methods do not protect against STIs. Condoms are still needed for STI prevention.'
+    );
+  }
 
   const stopwords = new Set([
     'what', 'how', 'is', 'are', 'the', 'a', 'an', 'i', 'you', 'to', 'for', 'of', 'in', 'on', 'and', 'or',
@@ -349,18 +468,39 @@ function buildResourceFallbackAnswer(query: string, chunks: RagChunk[]): string 
       .map((s) => s.trim())
       .filter(Boolean);
 
-    const best = sentences.find((s) => {
+    const candidates = sentences.filter((s) => {
       const lower = s.toLowerCase();
       if (s.length < 40 || s.length > 260) return false;
       if (/cookie|privacy policy|terms of use|copyright|all rights reserved/i.test(lower)) return false;
       if (/birth controlhow|stis-conditions|menu|breadcrumb/i.test(lower)) return false;
+      if (/effectiveness rate of birth control methods how pregnancy \(conception\) occurs/i.test(lower)) return false;
+      if (!emergencyQuery && /emergency contraception|plan b|copper iud/.test(lower)) return false;
+      if (/^[a-z]{1,3}\s+control\b/.test(lower)) return false;
+      if (!/^[A-Z0-9]/.test(s) && !lower.startsWith('birth control')) return false;
       return qTokens.length === 0 || qTokens.some((t) => lower.includes(t));
     });
+    if (candidates.length === 0) continue;
+
+    const scoredCandidates = candidates
+      .map((s) => {
+        const lower = s.toLowerCase();
+        const tokenHits = qTokens.reduce((acc, t) => (lower.includes(t) ? acc + 1 : acc), 0);
+        const startsClean = /^[A-Z0-9]/.test(s) ? 1 : 0;
+        const hasBirthControl = lower.includes('birth control') ? 1 : 0;
+        const score = tokenHits * 2 + startsClean + hasBirthControl;
+        return { s, score };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const best = scoredCandidates[0]?.s;
     if (!best) continue;
 
     const cleaned = best
       .replace(/\s+/g, ' ')
       .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/^[^A-Za-z0-9]*th control\b/i, 'Birth control')
+      .replace(/^[^A-Za-z0-9]*irth control\b/i, 'Birth control')
+      .replace(/^[^A-Za-z0-9]*rth control\b/i, 'Birth control')
       .trim();
     if (cleaned.length < 30) continue;
     if (picked.some((p) => p.toLowerCase() === cleaned.toLowerCase())) continue;
@@ -370,6 +510,16 @@ function buildResourceFallbackAnswer(query: string, chunks: RagChunk[]): string 
 
   if (picked.length === 0) return null;
 
+  if (
+    (lowerQuery.includes('what is birth control') || lowerQuery.includes('what birth control')) &&
+    picked.length > 0
+  ) {
+    return (
+      `${picked[0]}\n\n` +
+      'Most methods do not protect against STIs. Condoms are still needed for STI prevention.'
+    );
+  }
+
   return (
     `${picked.join('\n\n')}\n\n` +
     'I can give more detail if you want.'
@@ -377,12 +527,88 @@ function buildResourceFallbackAnswer(query: string, chunks: RagChunk[]): string 
 }
 
 function shouldUseLlmGeneralAnswer(
-  _query: string,
+  query: string,
   _fallbackContent: string,
-  triageStage: 'idle' | 'symptomCheck' | 'symptomDetails' | 'symptomDuration',
+  triageLock: boolean,
+  triageStage: TriageStage,
+  awaitingTriageShareConsent: boolean,
   awaitingSummaryConsent: boolean,
   summaryChatStage: SummaryChatStage
 ): boolean {
+  const lower = query.toLowerCase();
+  const clinicCommand =
+    lower.includes('open clinics') ||
+    lower.includes('nearest clinic') ||
+    lower.includes('find a clinic') ||
+    lower.includes('find clinic') ||
+    lower.includes('clinic near me');
+  const gcoCommand =
+    lower.includes('getcheckedonline') ||
+    lower.includes('get checked online') ||
+    lower.includes('get checkedonline');
+  const deterministicCondomOrMissedPill =
+    (lower.includes('need') && lower.includes('condom')) ||
+    ((lower.includes('miss') || lower.includes('forgot')) && lower.includes('pill'));
+  const asksContraceptionTypes =
+    (lower.includes('birth control') || lower.includes('contraception') || lower.includes('contraceptive')) &&
+    (lower.includes('type') || lower.includes('types') || lower.includes('method') || lower.includes('methods') || lower.includes('kind') || lower.includes('kinds') || lower.includes('option') || lower.includes('options'));
+  const asksContraceptivesOverview = lower.trim() === 'contraceptives' || lower.trim() === 'birth control';
+  const asksWhatIsPill =
+    lower.includes('what is the pill') ||
+    lower.includes('what is pill') ||
+    lower.includes('tell me about the pill') ||
+    lower.trim() === 'the pill';
+  const asksPillEffectiveness =
+    (lower.includes('pill') || lower.includes('birth control pill') || lower.includes('oral contraceptive')) &&
+    (lower.includes('effective') || lower.includes('effectiveness') || lower.includes('how effective'));
+  const asksStiTypes =
+    (lower.includes('types of sti') ||
+      lower.includes('type of sti') ||
+      lower.includes('different types of sti') ||
+      lower.includes('different types of stis') ||
+      lower.includes('different stis') ||
+      lower.includes('stis types')) &&
+    (lower.includes('sti') || lower.includes('std'));
+  const asksHowOftenTest = lower.includes('how often') && (lower.includes('test') || lower.includes('testing'));
+  const asksWhatIsGonorrhea =
+    lower.includes('what is gonorrhea') ||
+    lower.includes('what is the clap') ||
+    lower.includes('gonorrhea (the clap)') ||
+    ((lower.includes('gonorrhea') || lower.includes('the clap')) &&
+      (lower.includes('what is') || lower.includes('explain') || lower.includes('tell me')));
+  const asksIudHurt =
+    (lower.includes('iud') || lower.includes('intrauterine')) &&
+    (lower.includes('hurt') || lower.includes('painful') || lower.includes('pain'));
+  const asksMostCommonSti =
+    (lower.includes('most common sti') || lower.includes('most common std')) ||
+    ((lower.includes('common') || lower.includes('most common')) &&
+      (lower.includes('sti') || lower.includes('std')));
+  const asksGeneralBirthControlEffectiveness =
+    (lower.includes('birth control') || lower.includes('contraception')) &&
+    (lower.includes('effective') || lower.includes('effectiveness') || lower.includes('how effective'));
+  const asksMigraineOnPill =
+    (lower.includes('migraine') || lower.includes('headache')) &&
+    (lower.includes('pill') || lower.includes('birth control') || lower.includes('contraception'));
+  const priorityStiConcern = isPriorityStiConcernQuery(query);
+  if (triageLock) return false;
+  if (triageStage !== 'idle') return false;
+  if (deterministicCondomOrMissedPill) return false;
+  if (
+    asksContraceptionTypes ||
+    asksContraceptivesOverview ||
+    asksWhatIsPill ||
+    asksPillEffectiveness ||
+    asksGeneralBirthControlEffectiveness ||
+    asksMigraineOnPill ||
+    asksStiTypes ||
+    asksHowOftenTest ||
+    asksWhatIsGonorrhea ||
+    asksIudHurt ||
+    asksMostCommonSti
+  ) return false;
+  if (priorityStiConcern) return false;
+  if (clinicCommand || gcoCommand) return false;
+  if (awaitingTriageShareConsent) return false;
   if (awaitingSummaryConsent) return false;
   if (summaryChatStage !== 'idle') return false;
 
@@ -390,22 +616,120 @@ function shouldUseLlmGeneralAnswer(
   return true;
 }
 
+function isFastDeterministicQuery(query: string): boolean {
+  const lower = query.toLowerCase();
+  const clinicCommand =
+    lower.includes('open clinics') ||
+    lower.includes('nearest clinic') ||
+    lower.includes('find a clinic') ||
+    lower.includes('find clinic') ||
+    lower.includes('clinic near me');
+  const gcoCommand =
+    lower.includes('getcheckedonline') ||
+    lower.includes('get checked online') ||
+    lower.includes('get checkedonline');
+  const asksContraceptionTypes =
+    (lower.includes('birth control') || lower.includes('contraception') || lower.includes('contraceptive')) &&
+    (lower.includes('type') || lower.includes('types') || lower.includes('method') || lower.includes('methods') || lower.includes('kind') || lower.includes('kinds') || lower.includes('option') || lower.includes('options'));
+  const asksContraceptivesOverview = lower.trim() === 'contraceptives' || lower.trim() === 'birth control';
+  const asksWhatIsPill =
+    lower.includes('what is the pill') ||
+    lower.includes('what is pill') ||
+    lower.includes('tell me about the pill') ||
+    lower.trim() === 'the pill';
+  const asksPillEffectiveness =
+    (lower.includes('pill') || lower.includes('birth control pill') || lower.includes('oral contraceptive')) &&
+    (lower.includes('effective') || lower.includes('effectiveness') || lower.includes('how effective'));
+  const asksStiTypes =
+    (lower.includes('types of sti') ||
+      lower.includes('type of sti') ||
+      lower.includes('different types of sti') ||
+      lower.includes('different types of stis') ||
+      lower.includes('different stis') ||
+      lower.includes('stis types')) &&
+    (lower.includes('sti') || lower.includes('std'));
+  const asksHowOftenTest = lower.includes('how often') && (lower.includes('test') || lower.includes('testing'));
+  const asksWhatIsGonorrhea =
+    lower.includes('what is gonorrhea') ||
+    lower.includes('what is the clap') ||
+    lower.includes('gonorrhea (the clap)') ||
+    ((lower.includes('gonorrhea') || lower.includes('the clap')) &&
+      (lower.includes('what is') || lower.includes('explain') || lower.includes('tell me')));
+  const asksIudHurt =
+    (lower.includes('iud') || lower.includes('intrauterine')) &&
+    (lower.includes('hurt') || lower.includes('painful') || lower.includes('pain'));
+  const asksMostCommonSti =
+    (lower.includes('most common sti') || lower.includes('most common std')) ||
+    ((lower.includes('common') || lower.includes('most common')) &&
+      (lower.includes('sti') || lower.includes('std')));
+  const asksGeneralBirthControlEffectiveness =
+    (lower.includes('birth control') || lower.includes('contraception')) &&
+    (lower.includes('effective') || lower.includes('effectiveness') || lower.includes('how effective'));
+  const asksMigraineOnPill =
+    (lower.includes('migraine') || lower.includes('headache')) &&
+    (lower.includes('pill') || lower.includes('birth control') || lower.includes('contraception'));
+  return (
+    clinicCommand ||
+    gcoCommand ||
+    asksContraceptivesOverview ||
+    asksWhatIsPill ||
+    (lower.includes('need') && lower.includes('condom')) ||
+    ((lower.includes('miss') || lower.includes('forgot')) && lower.includes('pill')) ||
+    asksContraceptionTypes ||
+    asksPillEffectiveness ||
+    asksGeneralBirthControlEffectiveness ||
+    asksMigraineOnPill ||
+    asksStiTypes ||
+    asksHowOftenTest ||
+    asksWhatIsGonorrhea ||
+    asksIudHurt ||
+    asksMostCommonSti
+  );
+}
+
+function isBirthControlBasicsQuery(query: string): boolean {
+  const lower = query.toLowerCase();
+  return (
+    ((lower.includes('what') || lower.includes('explain')) && lower.includes('birth control')) ||
+    lower.includes('what is contraception') ||
+    ((lower.includes('do i need') || lower.includes('should i use')) && lower.includes('birth control'))
+  );
+}
+
 function getPreferredSourcesForQuery(query: string, fallbackSources: { label: string; url: string }[]): { label: string; url: string }[] {
   const lower = query.toLowerCase();
-  if (
+  const contraceptionLike =
     lower.includes('contraception') ||
+    lower.includes('contraceptive') ||
     lower.includes('birth control') ||
     lower.includes('pregnan') ||
     lower.includes('pregnant') ||
     lower.includes('plan b') ||
     lower.includes('iud') ||
     lower.includes('ring') ||
-    lower.includes('nuvaring')
-  ) {
+    lower.includes('nuvaring');
+  if (contraceptionLike) {
+    if (lower.includes('effective') || lower.includes('effectiveness') || lower.includes('typical') || lower.includes('perfect')) {
+      return [
+        { label: 'HealthLinkBC - The Pill (Combined)', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-pill' },
+        { label: 'HealthLinkBC - The Mini-Pill (Progestin)', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-mini-pill' },
+      ];
+    }
+    if (lower.includes('medication') || lower.includes('medications') || lower.includes('medicine') || lower.includes('drug')) {
+      return [
+        { label: 'HealthLinkBC File #91a - Hormonal Contraception', url: 'https://www.healthlinkbc.ca/healthlinkbc-files/hormonal-contraception' },
+        { label: 'HealthLinkBC - Hormonal Methods Overview', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+      ];
+    }
+    if (lower.includes('emergency') || lower.includes('plan b') || lower.includes('condom broke') || lower.includes('missed pill')) {
+      return [
+        { label: 'HealthLinkBC - Emergency Contraception', url: 'https://www.healthlinkbc.ca/health-topics/emergency-contraception' },
+        { label: 'HealthLinkBC - IUD (Intrauterine Device)', url: 'https://www.healthlinkbc.ca/health-topics/intrauterine-device-iud-birth-control' },
+      ];
+    }
     return [
-      { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' },
-      { label: 'HealthLinkBC - Birth Control Ring', url: 'https://www.healthlinkbc.ca/healthwise/birth-control-hormones-ring' },
-      { label: 'HealthLinkBC - Emergency Contraception', url: 'https://www.healthlinkbc.ca/healthlinkbc-files/emergency-contraception' },
+      { label: 'HealthLinkBC - Hormonal Methods Overview', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+      { label: 'HealthLinkBC - Barrier Methods', url: 'https://www.healthlinkbc.ca/health-topics/barrier-methods-birth-control' },
     ];
   }
 
@@ -429,7 +753,7 @@ function getPreferredSourcesForQuery(query: string, fallbackSources: { label: st
   return fallbackSources;
 }
 
-function shouldAttemptLlmExtraction(query: string, stage: 'idle' | 'symptomCheck' | 'symptomDetails' | 'symptomDuration'): boolean {
+function shouldAttemptLlmExtraction(query: string, stage: TriageStage): boolean {
   if (stage !== 'idle') return true;
   const lower = query.toLowerCase();
   return (
@@ -456,7 +780,7 @@ function isLikelyHealthQuery(query: string): boolean {
   const lower = query.toLowerCase();
   const healthTerms = [
     'sti', 'std', 'sex', 'sexual', 'test', 'testing', 'clinic', 'symptom', 'pregnan', 'pregnant',
-    'birth control', 'contraception', 'iud', 'pill', 'ring', 'nuvaring', 'condom', 'plan b',
+    'birth control', 'contraception', 'contraceptive', 'contraceptives', 'iud', 'pill', 'ring', 'nuvaring', 'condom', 'plan b',
     'hiv', 'gonorrhea', 'chlamydia', 'syphilis', 'herpes', 'hpv', 'hepatitis', 'prep', 'pep',
     'discharge', 'burning', 'pain when peeing', 'rash', 'itch',
   ];
@@ -713,23 +1037,29 @@ function parseSymptomList(input: string): string[] {
     .replace(/\s+/g, ' ')
     .trim();
 
-  const knownSymptoms = [
-    'burning when peeing',
-    'pain when peeing',
-    'pain peeing',
-    'discharge',
-    'sores',
-    'bumps',
-    'rash',
-    'itching',
-    'pelvic pain',
-    'abdominal pain',
-    'testicle pain',
-    'bleeding after sex',
-  ];
-
-  const found = knownSymptoms.filter((s) => normalized.includes(s));
-  if (found.length > 0) return found;
+  const found: string[] = [];
+  if (
+    normalized.includes('burning when peeing') ||
+    normalized.includes('burning when i pee') ||
+    normalized.includes('burning pee') ||
+    normalized.includes('burning')
+  ) found.push('burning when peeing');
+  if (
+    normalized.includes('pain when peeing') ||
+    normalized.includes('pain peeing') ||
+    normalized.includes('painful urination') ||
+    normalized.includes('hurts when i pee')
+  ) found.push('pain when peeing');
+  if (normalized.includes('discharge')) found.push('discharge');
+  if (normalized.includes('sore') || normalized.includes('ulcer')) found.push('sores');
+  if (normalized.includes('bump') || normalized.includes('blister') || normalized.includes('wart')) found.push('bumps');
+  if (normalized.includes('rash')) found.push('rash');
+  if (normalized.includes('itch') || normalized.includes('irritation')) found.push('itching');
+  if (normalized.includes('pelvic pain')) found.push('pelvic pain');
+  if (normalized.includes('abdominal pain') || normalized.includes('lower abdominal pain')) found.push('abdominal pain');
+  if (normalized.includes('testicle pain') || normalized.includes('testicular pain')) found.push('testicle pain');
+  if (normalized.includes('bleeding after sex')) found.push('bleeding after sex');
+  if (found.length > 0) return Array.from(new Set(found));
 
   return input
     .split(/,| and /i)
@@ -762,6 +1092,10 @@ function parseSymptomDuration(input: string): string | null {
 function inferTriagePrefillFromQuery(input: string): Partial<StoredTriageDraft> {
   const lower = input.toLowerCase();
   const updates: Partial<StoredTriageDraft> = {};
+  const parsedDate = parseFlexibleDateInput(input) || parseRelativeAgoDateInput(input);
+  if (parsedDate) {
+    updates.contactDate = parsedDate;
+  }
 
   // Condom context
   if (
@@ -978,11 +1312,26 @@ function parseFlexibleDateInput(input: string): string | null {
   return null;
 }
 
+function parseRelativeAgoDateInput(input: string): string | null {
+  const lower = input.toLowerCase();
+  const match = lower.match(/\b(\d{1,2})\s*(day|days|week|weeks|month|months)\s*ago\b/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (Number.isNaN(value) || value <= 0) return null;
+  const unit = match[2];
+  const d = new Date();
+  if (unit.startsWith('day')) d.setDate(d.getDate() - value);
+  if (unit.startsWith('week')) d.setDate(d.getDate() - (value * 7));
+  if (unit.startsWith('month')) d.setMonth(d.getMonth() - value);
+  return d.toISOString().slice(0, 16);
+}
+
 export function ChatPage() {
   const navigate = useNavigate();
   const [messages, setMessages] = useState<ChatMessage[]>([INITIAL_MESSAGE]);
   const [input, setInput] = useState('');
-  const [triageStage, setTriageStage] = useState<'idle' | 'symptomCheck' | 'symptomDetails' | 'symptomDuration'>('idle');
+  const [triageStage, setTriageStage] = useState<TriageStage>('idle');
+  const [triageLock, setTriageLock] = useState(false);
   const [symptomStatus, setSymptomStatus] = useState<'yes' | 'no' | 'unsure' | null>(null);
   const [chatSymptomDraft, setChatSymptomDraft] = useState<ChatSymptomTriageDraft>({
     symptoms: [],
@@ -999,6 +1348,8 @@ export function ChatPage() {
   const [summaryFormData, setSummaryFormData] = useState<PatientSummaryFormData | null>(null);
   const [showSummaryView, setShowSummaryView] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [awaitingTriageShareConsent, setAwaitingTriageShareConsent] = useState(false);
+  const [triageConsentContext, setTriageConsentContext] = useState<'symptomatic' | 'asymptomatic' | null>(null);
   const [awaitingSummaryConsent, setAwaitingSummaryConsent] = useState(false);
   const [summaryChatStage, setSummaryChatStage] = useState<SummaryChatStage>('idle');
   const [summaryChatDraft, setSummaryChatDraft] = useState<PatientSummaryFormData>(EMPTY_SUMMARY_FORM_DATA);
@@ -1007,7 +1358,7 @@ export function ChatPage() {
 
   const persistTriageDraft = (updates: Partial<StoredTriageDraft>) => {
     try {
-      const raw = localStorage.getItem(TRIAGE_DRAFT_STORAGE_KEY);
+      const raw = sessionStorage.getItem(TRIAGE_DRAFT_STORAGE_KEY);
       const existing = raw ? (JSON.parse(raw) as Partial<StoredTriageDraft>) : {};
       const merged: StoredTriageDraft = {
         hasSymptoms:
@@ -1028,11 +1379,12 @@ export function ChatPage() {
             ? existing.partnerKnownSti
             : undefined,
         sexTypes: Array.isArray(existing.sexTypes) ? existing.sexTypes : [],
+        contactDate: typeof existing.contactDate === 'string' ? existing.contactDate : '',
         whatHappened: typeof existing.whatHappened === 'string' ? existing.whatHappened : '',
         updatedAtISO: new Date().toISOString(),
         ...updates,
       };
-      localStorage.setItem(TRIAGE_DRAFT_STORAGE_KEY, JSON.stringify(merged));
+      sessionStorage.setItem(TRIAGE_DRAFT_STORAGE_KEY, JSON.stringify(merged));
     } catch {
       // Ignore storage failures and continue chat flow.
     }
@@ -1045,12 +1397,13 @@ export function ChatPage() {
     };
 
     try {
-      const raw = localStorage.getItem(TRIAGE_DRAFT_STORAGE_KEY);
+      const raw = sessionStorage.getItem(TRIAGE_DRAFT_STORAGE_KEY);
       if (!raw) return base;
       const triage = JSON.parse(raw) as Partial<StoredTriageDraft>;
       return {
         ...base,
         what_happened: base.what_happened || (triage.whatHappened || ''),
+        contact_date: base.contact_date || (triage.contactDate || ''),
         sex_types: base.sex_types.length > 0 ? base.sex_types : (Array.isArray(triage.sexTypes) ? triage.sexTypes : []),
         condom_use:
           base.condom_use !== EMPTY_SUMMARY_FORM_DATA.condom_use
@@ -1076,10 +1429,34 @@ export function ChatPage() {
 
   useEffect(() => {
     try {
-      const storedSummary = localStorage.getItem(SUMMARY_STORAGE_KEY);
-      const storedForm = localStorage.getItem(SUMMARY_FORM_STORAGE_KEY);
+      const storedChat = sessionStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
+      const storedSummary = sessionStorage.getItem(SUMMARY_STORAGE_KEY);
+      const storedForm = sessionStorage.getItem(SUMMARY_FORM_STORAGE_KEY);
       const storedUserName = sessionStorage.getItem(USER_NAME_STORAGE_KEY);
       const storedUserAge = sessionStorage.getItem(USER_AGE_STORAGE_KEY);
+      if (storedChat) {
+        const parsed = JSON.parse(storedChat) as Array<{
+          id?: string;
+          role?: 'user' | 'assistant';
+          content?: string;
+          sources?: Array<{ label: string; url: string }>;
+          timestamp?: string | Date;
+        }>;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const hydrated = parsed
+            .filter((m) => typeof m.id === 'string' && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+            .map((m) => ({
+              id: m.id as string,
+              role: m.role as 'user' | 'assistant',
+              content: m.content as string,
+              sources: Array.isArray(m.sources) ? m.sources : [],
+              timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+            }));
+          if (hydrated.length > 0) {
+            setMessages(hydrated);
+          }
+        }
+      }
       if (storedSummary) {
         setSummaryData(JSON.parse(storedSummary));
       }
@@ -1094,9 +1471,17 @@ export function ChatPage() {
         if (!Number.isNaN(parsed)) setUserAge(parsed);
       }
     } catch {
-      // Ignore malformed localStorage values and continue with empty state.
+      // Ignore malformed storage values and continue with empty state.
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify(messages));
+    } catch {
+      // Ignore storage write failures.
+    }
+  }, [messages]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1128,9 +1513,38 @@ export function ChatPage() {
   }, []);
 
   const handleSend = async () => {
+    if (isGenerating) return;
     if (!input.trim()) return;
 
-    const currentInput = input;
+    const currentInput = input.trim();
+    const latestAssistantContent = [...messages]
+      .reverse()
+      .find((m) => m.role === 'assistant')?.content || '';
+    const triagePromptHasChoices =
+      latestAssistantContent.includes('Type **"open clinics"**') &&
+      latestAssistantContent.includes('Type **"use this for my note"**');
+    const asymptomaticQuickChoicePrompt =
+      latestAssistantContent.includes('Type **"GetCheckedOnline"**') &&
+      latestAssistantContent.includes('Type **"open clinics"**');
+    const legacyNoSymptomPrompt =
+      latestAssistantContent.includes('Start with GetCheckedOnline') &&
+      latestAssistantContent.includes('Find a nearby clinic');
+    const normalizedCommandInput =
+      triagePromptHasChoices && (currentInput === '1' || currentInput === '1.')
+        ? 'open clinics'
+        : triagePromptHasChoices && (currentInput === '2' || currentInput === '2.')
+          ? 'use this for my note'
+          : asymptomaticQuickChoicePrompt && (currentInput === '1' || currentInput === '1.')
+            ? 'getcheckedonline'
+            : asymptomaticQuickChoicePrompt && (currentInput === '2' || currentInput === '2.')
+              ? 'open clinics'
+              : legacyNoSymptomPrompt && (currentInput === '1' || currentInput === '1.')
+                ? 'getcheckedonline'
+                : legacyNoSymptomPrompt && (currentInput === '2' || currentInput === '2.')
+                  ? 'find a clinic'
+                  : legacyNoSymptomPrompt && (currentInput === '3' || currentInput === '3.')
+                    ? 'use this for my note'
+                    : currentInput;
 
     const userMessage: ChatMessage = {
       id: Date.now().toString(),
@@ -1142,153 +1556,207 @@ export function ChatPage() {
     setMessages(prev => [...prev, userMessage]);
     setInput('');
 
+    if (normalizedCommandInput !== currentInput || isFastDeterministicQuery(normalizedCommandInput)) {
+      const direct = getResponse(normalizedCommandInput);
+      const assistantMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: postProcessAssistantContent(normalizedCommandInput, direct.content),
+        sources: normalizeResponseSources(direct.sources),
+        timestamp: new Date(),
+      };
+      setMessages(prev => [...prev, assistantMessage]);
+      return;
+    }
+
+    if (triageStage === 'idle' && isPriorityStiConcernQuery(normalizedCommandInput)) {
+      const direct = getResponse(normalizedCommandInput);
+      const assistantMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: postProcessAssistantContent(normalizedCommandInput, direct.content),
+        sources: normalizeResponseSources(direct.sources),
+        timestamp: new Date(),
+      };
+      setMessages(prev => [...prev, assistantMessage]);
+      return;
+    }
+
     setIsGenerating(true);
-    const detectedName = extractUserName(currentInput);
-    if (detectedName) {
-      setUserName(detectedName);
-      sessionStorage.setItem(USER_NAME_STORAGE_KEY, detectedName);
-    }
-    const detectedAge = extractUserAge(currentInput);
-    if (detectedAge) {
-      setUserAge(detectedAge);
-      sessionStorage.setItem(USER_AGE_STORAGE_KEY, String(detectedAge));
-    }
-
-    const healthQuery = isLikelyHealthQuery(currentInput);
-    const inferredPrefill = inferTriagePrefillFromQuery(currentInput);
-    if (Object.keys(inferredPrefill).length > 0) {
-      persistTriageDraft(inferredPrefill);
-    }
-    if (healthQuery && shouldAttemptLlmExtraction(currentInput, triageStage)) {
-      const llmPrefill = await extractTriageFieldsWithLLM(currentInput);
-      if (llmPrefill && Object.keys(llmPrefill).length > 0) {
-        persistTriageDraft(llmPrefill);
+    try {
+      const detectedName = extractUserName(currentInput);
+      if (detectedName) {
+        setUserName(detectedName);
+        sessionStorage.setItem(USER_NAME_STORAGE_KEY, detectedName);
       }
-    }
+      const detectedAge = extractUserAge(currentInput);
+      if (detectedAge) {
+        setUserAge(detectedAge);
+        sessionStorage.setItem(USER_AGE_STORAGE_KEY, String(detectedAge));
+      }
 
-    const inDeterministicFlow =
-      awaitingSummaryConsent || summaryChatStage !== 'idle' || triageStage !== 'idle';
+      const healthQuery = isLikelyHealthQuery(currentInput);
+      const inferredPrefill = inferTriagePrefillFromQuery(currentInput);
+      if (Object.keys(inferredPrefill).length > 0) {
+        persistTriageDraft(inferredPrefill);
+      }
+      if (healthQuery && shouldAttemptLlmExtraction(currentInput, triageStage)) {
+        const llmPrefill = await extractTriageFieldsWithLLM(currentInput);
+        if (llmPrefill && Object.keys(llmPrefill).length > 0) {
+          persistTriageDraft(llmPrefill);
+        }
+      }
 
-    // Keep strict rule flow for consent/triage stages. Otherwise, use LLM-first.
-    const initialFallback = inDeterministicFlow
-      ? getResponse(currentInput)
-      : { content: '', sources: [] as { label: string; url: string }[] };
+      const inDeterministicFlow =
+        awaitingTriageShareConsent || awaitingSummaryConsent || summaryChatStage !== 'idle' || triageStage !== 'idle' || triageLock;
 
-    let content = initialFallback.content;
-    let responseSources = initialFallback.sources;
-    const useLlmGeneral = shouldUseLlmGeneralAnswer(
-      currentInput,
-      initialFallback.content,
-      triageStage,
-      awaitingSummaryConsent,
-      summaryChatStage
-    );
-    if (useLlmGeneral) {
-      const ragChunks = healthQuery ? await retrieveRagContext(currentInput) : [];
-      const ragContextText = ragChunks
-        .map(
-          (c, i) =>
-            `[${i + 1}] ${c.sourceLabel} (${c.sourceUrl})\n${c.text.slice(0, 700)}`
-        )
-        .join('\n\n');
-      const inferredTriageStage = inDeterministicFlow
-        ? (triageStage === 'idle' ? 'symptomCheck' : triageStage)
-        : 'idle';
-      const llmGeneral = await getLLMGeneralResponse(currentInput, {
-        triageStage: inferredTriageStage,
-        fallbackContent: inferredTriageStage !== 'idle' ? initialFallback.content : undefined,
-        ragContextText: ragContextText || undefined,
-        userName: detectedName || userName,
-        userAge: detectedAge || userAge,
-        chatHistoryText: buildRecentHistoryText(messages, currentInput),
-      });
-      if (llmGeneral) {
-        content = normalizeLlmReply(llmGeneral);
-        responseSources =
-          ragChunks.length > 0
-            ? Array.from(
-                new Map(
-                  ragChunks.map((c) => [c.sourceUrl, { label: c.sourceLabel, url: c.sourceUrl }])
-                ).values()
-              )
-            : (healthQuery ? getPreferredSourcesForQuery(currentInput, fallback.sources) : []);
-      } else if (healthQuery && ragChunks.length > 0) {
-        // Health queries get one retry because local models often fail first call during warm-up.
-        const llmHealthRetry = await getLLMGeneralResponse(currentInput, {
+      const initialFallback = inDeterministicFlow
+        ? getResponse(currentInput)
+        : { content: '', sources: [] as { label: string; url: string }[] };
+
+      let content = initialFallback.content;
+      let responseSources = initialFallback.sources;
+      const useLlmGeneral = shouldUseLlmGeneralAnswer(
+        currentInput,
+        initialFallback.content,
+        triageLock,
+        triageStage,
+        awaitingTriageShareConsent,
+        awaitingSummaryConsent,
+        summaryChatStage
+      );
+      if (useLlmGeneral) {
+        const birthControlBasics = isBirthControlBasicsQuery(currentInput);
+        const ragChunks = healthQuery ? await retrieveRagContext(currentInput) : [];
+        const ragContextText = ragChunks
+          .map(
+            (c, i) =>
+              `[${i + 1}] ${c.sourceLabel} (${c.sourceUrl})\n${c.text.slice(0, 700)}`
+          )
+          .join('\n\n');
+        const inferredTriageStage = inDeterministicFlow
+          ? (triageStage === 'idle' ? 'symptomCheck' : triageStage)
+          : 'idle';
+        const llmGeneral = await getLLMGeneralResponse(currentInput, {
           triageStage: inferredTriageStage,
           fallbackContent: inferredTriageStage !== 'idle' ? initialFallback.content : undefined,
           ragContextText: ragContextText || undefined,
           userName: detectedName || userName,
           userAge: detectedAge || userAge,
           chatHistoryText: buildRecentHistoryText(messages, currentInput),
-          timeoutMs: 24000,
+          timeoutMs: birthControlBasics ? 24000 : undefined,
         });
+        if (llmGeneral) {
+          content = postProcessAssistantContent(currentInput, llmGeneral);
+          responseSources =
+            ragChunks.length > 0
+              ? Array.from(
+                  new Map(
+                    ragChunks.map((c) => [c.sourceUrl, { label: c.sourceLabel, url: c.sourceUrl }])
+                  ).values()
+                )
+              : (healthQuery ? getPreferredSourcesForQuery(currentInput, fallback.sources) : []);
+        } else if (healthQuery && ragChunks.length > 0) {
+          const llmHealthRetry = await getLLMGeneralResponse(currentInput, {
+            triageStage: inferredTriageStage,
+            fallbackContent: inferredTriageStage !== 'idle' ? initialFallback.content : undefined,
+            ragContextText: ragContextText || undefined,
+            userName: detectedName || userName,
+            userAge: detectedAge || userAge,
+            chatHistoryText: buildRecentHistoryText(messages, currentInput),
+            timeoutMs: birthControlBasics ? 30000 : 24000,
+          });
 
-        if (llmHealthRetry) {
-          content = normalizeLlmReply(llmHealthRetry);
-          responseSources = Array.from(
-            new Map(
-              ragChunks.map((c) => [c.sourceUrl, { label: c.sourceLabel, url: c.sourceUrl }])
-            ).values()
-          );
-        } else {
-          const resourceFallback = buildResourceFallbackAnswer(currentInput, ragChunks);
-          if (resourceFallback) {
-            content = resourceFallback;
+          if (llmHealthRetry) {
+            content = postProcessAssistantContent(currentInput, llmHealthRetry);
             responseSources = Array.from(
               new Map(
                 ragChunks.map((c) => [c.sourceUrl, { label: c.sourceLabel, url: c.sourceUrl }])
               ).values()
             );
+          } else {
+            const resourceFallback = buildResourceFallbackAnswer(currentInput, ragChunks);
+            if (resourceFallback) {
+              content = resourceFallback;
+              responseSources = Array.from(
+                new Map(
+                  ragChunks.map((c) => [c.sourceUrl, { label: c.sourceLabel, url: c.sourceUrl }])
+                ).values()
+              );
+            }
+          }
+        } else if (!healthQuery) {
+          const llmRetry = await getLLMGeneralResponse(currentInput, {
+            triageStage: 'idle',
+            userName: detectedName || userName,
+            userAge: detectedAge || userAge,
+            chatHistoryText: buildRecentHistoryText(messages, currentInput),
+          });
+          if (llmRetry) {
+            content = postProcessAssistantContent(currentInput, llmRetry);
+            responseSources = [];
+          } else if (detectedAge) {
+            const name = detectedName || userName;
+            content = name
+              ? `Thanks ${name}, I noted you are ${detectedAge}. What would you like help with next?`
+              : `Thanks, I noted you are ${detectedAge}. What would you like help with next?`;
+            responseSources = [];
+          } else {
+            content = detectedName || userName
+              ? `Hi ${detectedName || userName}. I am here and ready to help. Ask me anything about sexual health, STI testing, contraception, or pregnancy.`
+              : 'Hi. I am here and ready to help with sexual health, STI testing, contraception, and pregnancy questions.';
+            responseSources = [];
           }
         }
-      } else if (!healthQuery) {
-        // Retry once for casual turns because model warm-up can fail first call.
-        const llmRetry = await getLLMGeneralResponse(currentInput, {
-          triageStage: 'idle',
-          userName: detectedName || userName,
-          userAge: detectedAge || userAge,
-          chatHistoryText: buildRecentHistoryText(messages, currentInput),
-        });
-        if (llmRetry) {
-          content = normalizeLlmReply(llmRetry);
-          responseSources = [];
-        } else if (detectedAge) {
-          const name = detectedName || userName;
-          content = name
-            ? `Thanks ${name}, I noted you are ${detectedAge}. What would you like help with next?`
-            : `Thanks, I noted you are ${detectedAge}. What would you like help with next?`;
-          responseSources = [];
-        } else {
-          content = detectedName || userName
-            ? `Hi ${detectedName || userName}. I am here and ready to help. Ask me anything about sexual health, STI testing, contraception, or pregnancy.`
-            : 'Hi. I am here and ready to help with sexual health, STI testing, contraception, and pregnancy questions.';
-          responseSources = [];
-        }
       }
+
+      if (!content) {
+        const fallback = getResponse(currentInput);
+        content = fallback.content;
+        responseSources = fallback.sources;
+      }
+
+      const assistantMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: postProcessAssistantContent(currentInput, content),
+        sources: normalizeResponseSources(responseSources),
+        timestamp: new Date(),
+      };
+
+      setMessages(prev => [...prev, assistantMessage]);
+    } catch {
+      const recoveryMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content:
+          'Sorry, I hit a temporary issue. Please try your question again now, and I will answer right away.',
+        sources: [],
+        timestamp: new Date(),
+      };
+      setMessages(prev => [...prev, recoveryMessage]);
+    } finally {
+      setIsGenerating(false);
     }
-
-    // Final fallback to rules only when LLM did not produce content.
-    if (!content) {
-      const fallback = getResponse(currentInput);
-      content = fallback.content;
-      responseSources = fallback.sources;
-    }
-
-    const assistantMessage: ChatMessage = {
-      id: (Date.now() + 1).toString(),
-      role: 'assistant',
-      content,
-      sources: responseSources,
-      timestamp: new Date(),
-    };
-
-    setMessages(prev => [...prev, assistantMessage]);
-    setIsGenerating(false);
   };
 
   const getResponse = (query: string): { content: string; sources: { label: string; url: string }[] } => {
     const lowerQuery = query.toLowerCase();
+
+    if (lowerQuery.includes('need') && lowerQuery.includes('condom')) {
+      return {
+        content:
+          '**Short answer: condoms are still recommended.**\n\n' +
+          '- Condoms lower STI risk.\n' +
+          '- If you also want pregnancy prevention, combine condoms with another birth control method.\n' +
+          '- Even with one partner, condoms are helpful unless both partners are tested and mutually monogamous.\n\n' +
+          'If you want, I can suggest options based on your situation.',
+        sources: [
+          { label: 'SmartSexResource - Safer Sex', url: 'https://smartsexresource.com/sexually-transmitted-infections/sti-basics/safer-sex/' },
+          { label: 'HealthLinkBC - Birth Control Overview', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+        ],
+      };
+    }
 
     // In-chat consent gate before opening patient summary
     if (awaitingSummaryConsent) {
@@ -1341,6 +1809,46 @@ export function ChatPage() {
         sources: [
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }
         ],
+      };
+    }
+
+    // Consent gate before quick triage-prefill questions for provider sharing
+    if (awaitingTriageShareConsent) {
+      const consentReply = normalizeYesNoUnsure(query);
+      if (consentReply === 'yes') {
+        setAwaitingTriageShareConsent(false);
+        setTriageStage('whatHappened');
+        return {
+          content:
+            'Thank you. I will ask **5 quick questions** to prefill a note you can choose to share with a provider.\n\n' +
+            '**Quick 1/5:** One-line reason for visit (for the note)\n' +
+            'Example: "New partner, condom broke, now burning when peeing".\n' +
+            'You can type **skip**.',
+          sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+        };
+      }
+
+      if (consentReply === 'no') {
+        const wasAsymptomatic = triageConsentContext === 'asymptomatic';
+        setAwaitingTriageShareConsent(false);
+        setTriageConsentContext(null);
+        setTriageStage('idle');
+        setTriageLock(false);
+        return {
+          content:
+            'No problem. I will not ask the provider-share questions.\n\n' +
+            (wasAsymptomatic
+              ? '**Next steps:**\n1. Type **"GetCheckedOnline"** for online testing.\n2. Type **"open clinics"** for in-person care.'
+              : '**Next steps:**\n1. Type **"open clinics"** to find nearby in-person care.\n2. Type **"use this for my note"** if you want to create a shareable note later.'),
+          sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+        };
+      }
+
+      return {
+        content:
+          'Before I continue with the provider-share questions, please confirm consent.\n\n' +
+          'Reply **"yes"** to continue or **"no"** to skip.',
+        sources: [{ label: 'SmartSexResource - Privacy', url: 'https://smartsexresource.com' }],
       };
     }
 
@@ -1556,7 +2064,7 @@ export function ChatPage() {
         setSummaryChatStage('pregnancy_possible');
         return {
           content: '**9/10** Pregnancy possibility or trying to conceive? Reply **yes**, **no**, or **unsure**. You can type **skip**.',
-          sources: [{ label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }],
+          sources: [{ label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }],
         };
       }
 
@@ -1569,7 +2077,7 @@ export function ChatPage() {
         setSummaryChatStage('pregnancy_possible');
         return {
           content: '**9/10** Pregnancy possibility or trying to conceive? Reply **yes**, **no**, or **unsure**.',
-          sources: [{ label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }],
+          sources: [{ label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }],
         };
       }
 
@@ -1578,7 +2086,7 @@ export function ChatPage() {
         if (!status && !skipRequested) {
           return {
             content: 'Please reply **yes**, **no**, or **unsure**.',
-            sources: [{ label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }],
+            sources: [{ label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }],
           };
         }
         const next = {
@@ -1621,8 +2129,8 @@ export function ChatPage() {
         const summary = generatePatientSummary(finalData);
         setSummaryFormData(finalData);
         setSummaryData(summary);
-        localStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(finalData));
-        localStorage.setItem(SUMMARY_STORAGE_KEY, JSON.stringify(summary));
+        sessionStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(finalData));
+        sessionStorage.setItem(SUMMARY_STORAGE_KEY, JSON.stringify(summary));
         setShowSummaryView(true);
 
         return {
@@ -1647,6 +2155,11 @@ export function ChatPage() {
           content:
             '**Thanks for telling me.**\n\n' +
             'Because you have symptoms, it is safest to be seen in person instead of using GetCheckedOnline.\n\n' +
+            '**While you wait for care:**\n' +
+            '- Avoid sex until you are assessed\n' +
+            '- Avoid douching or harsh soaps on genitals\n' +
+            '- Do not start leftover antibiotics\n' +
+            '- Seek urgent care now if severe pain, fever, or swelling develops\n\n' +
             'Please list the symptoms you are noticing now (for example: burning when peeing, discharge, sores, rash).',
           sources: [
             {
@@ -1660,7 +2173,10 @@ export function ChatPage() {
       // User reports no symptoms
       if (symptomStatusReply === 'no') {
         setTriageStage('idle');
+        setTriageLock(false);
         setSymptomStatus('no');
+        setAwaitingTriageShareConsent(false);
+        setTriageConsentContext(null);
         persistTriageDraft({
           hasSymptoms: 'no',
           selectedSymptoms: [],
@@ -1669,11 +2185,18 @@ export function ChatPage() {
         return {
           content:
             '**Okay, you do not have symptoms right now.**\n\n' +
-            'If you have had sexual contact that could expose you to STIs, online testing can still be a good idea.\n\n' +
-            '**Next steps (you can choose):**\n' +
-            '1. Type **"GetCheckedOnline"** to learn how to start online testing.\n' +
-            '2. Type **"find a clinic"** if you prefer an in-person visit.\n' +
-            '3. Or ask another question about STIs or testing.',
+            'That lowers immediate urgency, but testing can still be important after new exposure.\n\n' +
+            '**When GetCheckedOnline is usually a good fit:**\n' +
+            '- Routine STI screening\n' +
+            '- A change in sexual behaviours\n' +
+            '- Testing after a sexual contact (often around **3 weeks** and again at **3 months**)\n\n' +
+            '**How often to test (general guide):**\n' +
+            '- Usually every **3-12 months** based on risk\n' +
+            '- If you or partners have new/casual partners, every **3-6 months** is common\n' +
+            '- Testing more often than every 3 months is usually not needed\n\n' +
+            '**Next step:**\n' +
+            '1. Type **"GetCheckedOnline"** to start online testing now.\n' +
+            '2. Type **"open clinics"** if you prefer in-person care.',
           sources: [
             { label: 'GetCheckedOnline', url: 'https://getcheckedonline.com' },
             { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
@@ -1763,46 +2286,20 @@ export function ChatPage() {
         duration,
       });
       setTriageStage('idle');
-
-      let savedDraft: StoredTriageDraft | null = null;
-      try {
-        const raw = localStorage.getItem(TRIAGE_DRAFT_STORAGE_KEY);
-        if (raw) {
-          savedDraft = JSON.parse(raw) as StoredTriageDraft;
-        }
-      } catch {
-        // Ignore malformed storage and continue with chat-only values.
-      }
-
-      const prefilledForm: PatientSummaryFormData = {
-        what_happened: savedDraft?.whatHappened || 'Symptoms requiring in-person STI assessment',
-        contact_date: '',
-        sex_types: savedDraft?.sexTypes || [],
-        condom_use: savedDraft?.condomUse || 'no condom',
-        has_symptoms: true,
-        symptoms_list:
-          chatSymptomDraft.symptoms.join(', ') ||
-          (savedDraft?.selectedSymptoms && savedDraft.selectedSymptoms.length > 0
-            ? savedDraft.selectedSymptoms.join(', ')
-            : ''),
-        symptom_duration: duration,
-        partner_known_sti: savedDraft?.partnerKnownSti || 'unsure',
-        current_medications: false,
-        medications_list: '',
-        pregnancy_possible: 'unsure',
-        allergies_meds: 'NKDA',
-        preferred_language: 'English',
-      };
-      setSummaryFormData(prefilledForm);
-      localStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(prefilledForm));
+      setAwaitingTriageShareConsent(true);
+      setTriageConsentContext('symptomatic');
 
       return {
         content:
           `Got it - symptoms for **${duration}**.\n\n` +
           'Based on your symptoms, in-person assessment is recommended.\n\n' +
-          '**Next steps:**\n' +
-          '1. Type **"open clinics"** to see nearby clinics now.\n' +
-          '2. Type **"use this for my note"** to open a prefilled patient summary note.',
+          '**How to manage symptoms while waiting for care:**\n' +
+          '- Avoid sex until assessed\n' +
+          '- Drink fluids and avoid irritants in the genital area\n' +
+          '- Do not self-start old antibiotics\n' +
+          '- Go to urgent care now for severe pain, fever, or swelling\n\n' +
+          'Would you like me to ask **5 quick triage questions** to prefill a note you can choose to share with your provider?\n\n' +
+          'Reply **"yes"** or **"no"**.',
         sources: [
           {
             label: 'SmartSexResource - Clinics & Testing',
@@ -1812,7 +2309,238 @@ export function ChatPage() {
       };
     }
 
-    if (lowerQuery.includes('open clinics') || lowerQuery.includes('nearest clinic')) {
+    if (triageStage === 'contactDate') {
+      const skipRequested = lowerQuery === 'skip' || lowerQuery === 'n/a' || lowerQuery === 'na';
+      if (skipRequested) {
+        persistTriageDraft({ contactDate: '' });
+        setTriageStage('sexTypes');
+        return {
+          content:
+            '**Quick 3/5:** Types of sex during that contact?\n' +
+            'Options: oral, vaginal, anal, other.\n' +
+            'You can list multiple or type **skip**.',
+          sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+        };
+      }
+
+      const parsedDate = parseFlexibleDateInput(query);
+      if (!parsedDate) {
+        return {
+          content:
+            'I could not read that date/time. Try formats like `2026-03-01 14:30`, `March 1 2026`, `03/01/2026`, or `yesterday`. You can also type **skip**.',
+          sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+        };
+      }
+
+      persistTriageDraft({ contactDate: parsedDate });
+      setTriageStage('sexTypes');
+      return {
+        content:
+          '**Quick 3/5:** Types of sex during that contact?\n' +
+          'Options: oral, vaginal, anal, other.\n' +
+          'You can list multiple or type **skip**.',
+        sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+      };
+    }
+
+    if (triageStage === 'sexTypes') {
+      const skipRequested = lowerQuery === 'skip' || lowerQuery === 'n/a' || lowerQuery === 'na';
+      if (!skipRequested) {
+        const sexTypes = parseSexTypesInput(query);
+        if (sexTypes.length === 0) {
+          return {
+            content: 'Please include at least one option: oral, vaginal, anal, or other. You can also type **skip**.',
+            sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+          };
+        }
+        persistTriageDraft({ sexTypes });
+      }
+
+      setTriageStage('condomUse');
+      return {
+        content:
+          '**Quick 4/5:** Condom use?\n' +
+          '1. used throughout\n' +
+          '2. used sometimes\n' +
+          '3. no condom\n' +
+          '4. condom broke\n\n' +
+          'You can type **skip**.',
+        sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+      };
+    }
+
+    if (triageStage === 'condomUse') {
+      const skipRequested = lowerQuery === 'skip' || lowerQuery === 'n/a' || lowerQuery === 'na';
+      if (!skipRequested) {
+        const condomUse = parseCondomUseInput(query);
+        if (!condomUse) {
+          return {
+            content: 'Please choose 1-4, or reply with: used throughout, used sometimes, no condom, condom broke.',
+            sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+          };
+        }
+        persistTriageDraft({ condomUse });
+      }
+
+      setTriageStage('partnerKnownSti');
+      return {
+        content: '**Quick 5/5:** Any partner with a known STI or recent positive test? Reply **yes**, **no**, or **unsure**. You can type **skip**.',
+        sources: [{ label: 'SmartSexResource - Partner Notification', url: 'https://smartsexresource.com/sexually-transmitted-infections/partner-notification/' }],
+      };
+    }
+
+    if (triageStage === 'partnerKnownSti') {
+      const skipRequested = lowerQuery === 'skip' || lowerQuery === 'n/a' || lowerQuery === 'na';
+      if (!skipRequested) {
+        const status = normalizeYesNoUnsure(query);
+        if (!status) {
+          return {
+            content: 'Please reply **yes**, **no**, or **unsure**. You can also type **skip**.',
+            sources: [{ label: 'SmartSexResource - Partner Notification', url: 'https://smartsexresource.com/sexually-transmitted-infections/partner-notification/' }],
+          };
+        }
+        persistTriageDraft({ partnerKnownSti: status });
+      }
+
+      setTriageStage('idle');
+      setTriageConsentContext(null);
+      setTriageLock(false);
+
+      let savedDraft: StoredTriageDraft | null = null;
+      try {
+        const raw = sessionStorage.getItem(TRIAGE_DRAFT_STORAGE_KEY);
+        if (raw) {
+          savedDraft = JSON.parse(raw) as StoredTriageDraft;
+        }
+      } catch {
+        // Ignore malformed storage and continue with chat-only values.
+      }
+
+      const prefilledForm: PatientSummaryFormData = {
+        what_happened:
+          savedDraft?.whatHappened ||
+          (savedDraft?.hasSymptoms === 'yes' ? 'Symptoms requiring in-person STI assessment' : 'Recent STI exposure concern'),
+        contact_date: savedDraft?.contactDate || '',
+        sex_types: savedDraft?.sexTypes || [],
+        condom_use: savedDraft?.condomUse || 'no condom',
+        has_symptoms: savedDraft?.hasSymptoms === 'yes',
+        symptoms_list:
+          chatSymptomDraft.symptoms.join(', ') ||
+          (savedDraft?.selectedSymptoms && savedDraft.selectedSymptoms.length > 0
+            ? savedDraft.selectedSymptoms.join(', ')
+            : ''),
+        symptom_duration: savedDraft?.duration || chatSymptomDraft.duration || '',
+        partner_known_sti: savedDraft?.partnerKnownSti || 'unsure',
+        current_medications: false,
+        medications_list: '',
+        pregnancy_possible: 'unsure',
+        allergies_meds: 'NKDA',
+        preferred_language: 'English',
+      };
+      setSummaryFormData(prefilledForm);
+      sessionStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(prefilledForm));
+
+      return {
+        content:
+          '**Thanks - I prefilled more of your triage form.**\n\n' +
+          '**Next steps:**\n' +
+          '1. Type **"open clinics"** to see nearby clinics now.\n' +
+          '2. Type **"use this for my note"** to open your prefilled patient summary note.',
+        sources: [
+          { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
+        ],
+      };
+    }
+
+    if (triageStage === 'whatHappened') {
+      const skipRequested = lowerQuery === 'skip' || lowerQuery === 'n/a' || lowerQuery === 'na';
+      if (!skipRequested && query.trim()) {
+        persistTriageDraft({ whatHappened: query.trim().slice(0, 220) });
+      }
+      setTriageStage('contactDate');
+      return {
+        content:
+          '**Quick 2/5:** When was the most recent sexual contact that concerns you?\n' +
+          'You can enter a date/time (for example: `2026-03-01 14:30`, `March 1 2026`, `yesterday`) or type **skip**.',
+        sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
+      };
+    }
+
+    if (
+      lowerQuery.includes('access code') ||
+      lowerQuery.includes('show my code') ||
+      lowerQuery.includes('share code')
+    ) {
+      try {
+        const raw = localStorage.getItem(ACCESS_CODE_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as { code?: string; expiresAtISO?: string };
+          const expiryMs = parsed.expiresAtISO ? Date.parse(parsed.expiresAtISO) : Number.NaN;
+          const hasValidCode =
+            typeof parsed.code === 'string' &&
+            parsed.code.length === 6 &&
+            !Number.isNaN(expiryMs) &&
+            Date.now() < expiryMs;
+
+          if (hasValidCode) {
+            navigate('/share');
+            return {
+              content: 'Opening your secure access code now.',
+              sources: [],
+            };
+          }
+        }
+      } catch {
+        // Ignore malformed stored code.
+      }
+
+      return {
+        content:
+          'I could not find an active access code yet. Generate one by opening **Share with Clinic** after creating your summary note.',
+        sources: [{ label: 'SIA Privacy', url: 'https://sia.bccdc.ca/privacy' }],
+      };
+    }
+
+    const triagePromptedOpenClinics =
+      (lowerQuery === '1' || lowerQuery === '1.') &&
+      messages.length > 0 &&
+      messages[messages.length - 1]?.content.includes('Type **"open clinics"**');
+
+    const triagePromptedGetCheckedOnline =
+      (lowerQuery === '1' || lowerQuery === '1.') &&
+      messages.length > 0 &&
+      messages[messages.length - 1]?.content.includes('Type **"GetCheckedOnline"**');
+
+    if (
+      lowerQuery.includes('getcheckedonline') ||
+      lowerQuery.includes('get checked online') ||
+      lowerQuery.includes('get checkedonline') ||
+      triagePromptedGetCheckedOnline
+    ) {
+      return {
+        content:
+          '**GetCheckedOnline (BC) - next steps**\n\n' +
+          '1. Open: https://getcheckedonline.com\n' +
+          '2. Create/sign in to your account\n' +
+          '3. Complete the testing questionnaire\n' +
+          '4. Get your lab form and go to a participating lab (such as LifeLabs)\n' +
+          '5. Check results online\n\n' +
+          'If you develop symptoms, had sex with someone known to have an STI, need tests not offered online, want support after sexual assault, or need a printed named result, choose **"open clinics"** instead.',
+        sources: [
+          { label: 'GetCheckedOnline', url: 'https://getcheckedonline.com' },
+          { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
+        ],
+      };
+    }
+
+    if (
+      lowerQuery.includes('open clinics') ||
+      lowerQuery.includes('nearest clinic') ||
+      lowerQuery.includes('find a clinic') ||
+      lowerQuery.includes('find clinic') ||
+      lowerQuery.includes('clinic near me') ||
+      triagePromptedOpenClinics
+    ) {
       navigate('/clinics?from=chat&autoLocate=1');
       return {
         content: 'Opening nearby clinic options now.',
@@ -1832,6 +2560,166 @@ export function ChatPage() {
           'Reply **"yes"** to continue or **"no"** to cancel.',
         sources: [
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }
+        ],
+      };
+    }
+
+    if (lowerQuery.trim() === 'contraceptives' || lowerQuery.trim() === 'birth control') {
+      return {
+        content:
+          '**Main birth control types**\n\n' +
+          '- **Barrier:** condoms, internal condoms, diaphragm\n' +
+          '- **Hormonal:** pill, patch, ring, shot\n' +
+          '- **Long-acting reversible (LARC):** IUDs, implant\n' +
+          '- **Emergency contraception:** Plan B, ulipristal (Ella), copper IUD\n' +
+          '- **Permanent:** tubal ligation, vasectomy\n\n' +
+          'Most methods prevent pregnancy, but only condoms help protect against STIs. Want a quick comparison by effectiveness?',
+        sources: [
+          { label: 'HealthLinkBC - Birth Control Overview', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+          { label: 'HealthLinkBC - Barrier Methods', url: 'https://www.healthlinkbc.ca/health-topics/barrier-methods-birth-control' },
+        ],
+      };
+    }
+
+    if (
+      (lowerQuery.includes('birth control') || lowerQuery.includes('contraception') || lowerQuery.includes('contraceptive')) &&
+      (lowerQuery.includes('type') || lowerQuery.includes('types') || lowerQuery.includes('method') || lowerQuery.includes('methods') || lowerQuery.includes('option') || lowerQuery.includes('options'))
+    ) {
+      return {
+        content:
+          '**Different types of birth control**\n\n' +
+          '- **Pill** (daily)\n' +
+          '- **Patch** (weekly)\n' +
+          '- **Ring** (monthly)\n' +
+          '- **Shot** (every 3 months)\n' +
+          '- **IUD** (3-10 years, depending on type)\n' +
+          '- **Implant** (up to 3 years)\n' +
+          '- **Condoms/internal condoms** (every sex act)\n' +
+          '- **Emergency contraception** (after unprotected sex)\n\n' +
+          'Most hormonal/LARC options are very effective for pregnancy prevention. Condoms are still needed for STI protection.',
+        sources: [
+          { label: 'HealthLinkBC - Birth Control Overview', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+          { label: 'HealthLinkBC - IUD', url: 'https://www.healthlinkbc.ca/health-topics/intrauterine-device-iud-birth-control' },
+        ],
+      };
+    }
+
+    if (
+      lowerQuery.includes('what is the pill') ||
+      lowerQuery.includes('what is pill') ||
+      lowerQuery.includes('tell me about the pill') ||
+      lowerQuery.trim() === 'the pill'
+    ) {
+      return {
+        content:
+          '**What is the pill?**\n\n' +
+          'The pill is a daily birth control medication. There are two main types:\n' +
+          '- **Combined pill** (estrogen + progestin)\n' +
+          '- **Mini-pill** (progestin only)\n\n' +
+          'It works mainly by preventing ovulation. It does not protect against STIs, so condoms are still recommended for STI prevention.',
+        sources: [
+          { label: 'HealthLinkBC - The Pill (Combined)', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-pill' },
+          { label: 'HealthLinkBC - The Mini-Pill', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-mini-pill' },
+        ],
+      };
+    }
+
+    if (
+      (lowerQuery.includes('pill') || lowerQuery.includes('birth control pill') || lowerQuery.includes('oral contraceptive')) &&
+      (lowerQuery.includes('effective') || lowerQuery.includes('effectiveness') || lowerQuery.includes('how effective'))
+    ) {
+      return {
+        content:
+          '**How effective is the pill?**\n\n' +
+          '- With **typical use**: about **93% effective**\n' +
+          '- With **perfect use**: over **99% effective**\n\n' +
+          'Missing pills lowers protection. Using condoms too gives STI protection and extra pregnancy prevention.',
+        sources: [
+          { label: 'HealthLinkBC - The Pill (Combined)', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-pill' },
+          { label: 'HealthLinkBC - The Mini-Pill', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-mini-pill' },
+        ],
+      };
+    }
+
+    if (
+      (lowerQuery.includes('types of sti') ||
+        lowerQuery.includes('type of sti') ||
+        lowerQuery.includes('different types of sti') ||
+        lowerQuery.includes('different types of stis') ||
+        lowerQuery.includes('different stis') ||
+        lowerQuery.includes('stis types')) &&
+      (lowerQuery.includes('sti') || lowerQuery.includes('std'))
+    ) {
+      return {
+        content:
+          '**Different types of STIs**\n\n' +
+          '- **Bacterial:** chlamydia, gonorrhea, syphilis\n' +
+          '- **Viral:** HIV, herpes (HSV), HPV, hepatitis B/C\n' +
+          '- **Parasitic/protozoal:** trichomoniasis\n\n' +
+          'Some STIs are curable (for example chlamydia, gonorrhea, syphilis). Others are manageable long-term (for example HIV, herpes). Many STIs can have no symptoms, so testing is important.',
+        sources: [
+          { label: 'SmartSexResource - STIs and Conditions', url: 'https://smartsexresource.com/sexually-transmitted-infections/stis-conditions/' },
+          { label: 'STIs at a Glance PDF', url: 'https://smartsexresource.com/wp-content/uploads/resources/STIs-at-a-Glance-pages_October_2024-1.pdf' },
+        ],
+      };
+    }
+
+    if (
+      lowerQuery.includes('what is gonorrhea') ||
+      lowerQuery.includes('what is the clap') ||
+      lowerQuery.includes('gonorrhea (the clap)') ||
+      ((lowerQuery.includes('gonorrhea') || lowerQuery.includes('the clap')) &&
+        (lowerQuery.includes('what is') || lowerQuery.includes('explain') || lowerQuery.includes('tell me')))
+    ) {
+      return {
+        content:
+          '**What is gonorrhea (the clap)?**\n\n' +
+          'Gonorrhea is a common bacterial STI. It can infect the genitals, rectum, and throat.\n\n' +
+          '**Common symptoms:** burning when peeing, discharge, pelvic/testicular pain. Many people have no symptoms.\n\n' +
+          '**Testing:** urine sample or swab (site depends on exposure).\n' +
+          '**Treatment:** antibiotics. Partners should also be tested and treated.\n\n' +
+          'If symptoms are present, in-person care is recommended.',
+        sources: [
+          { label: 'SmartSexResource - Gonorrhea', url: 'https://smartsexresource.com/sexually-transmitted-infections/stis-conditions/gonorrhea/' },
+          { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
+        ],
+      };
+    }
+
+    if (
+      (lowerQuery.includes('iud') || lowerQuery.includes('intrauterine')) &&
+      (lowerQuery.includes('hurt') || lowerQuery.includes('painful') || lowerQuery.includes('pain'))
+    ) {
+      return {
+        content:
+          '**Do IUDs hurt?**\n\n' +
+          'Insertion can be uncomfortable, often like strong period cramps for a short time. Pain level varies by person.\n\n' +
+          '**What can help:**\n' +
+          '- Ask about pain-control options before insertion\n' +
+          '- Take recommended pain medication beforehand (if advised)\n' +
+          '- Plan a lighter day afterward\n\n' +
+          'Many people feel better within hours to a day. If severe pain continues, seek medical care.',
+        sources: [
+          { label: 'HealthLinkBC - IUD', url: 'https://www.healthlinkbc.ca/health-topics/intrauterine-device-iud-birth-control' },
+          { label: 'SmartSexResource - Birth Control', url: 'https://smartsexresource.com' },
+        ],
+      };
+    }
+
+    if (
+      lowerQuery.includes('most common sti') ||
+      lowerQuery.includes('most common std') ||
+      ((lowerQuery.includes('common') || lowerQuery.includes('most common')) &&
+        (lowerQuery.includes('sti') || lowerQuery.includes('std')))
+    ) {
+      return {
+        content:
+          '**What is the most common STI?**\n\n' +
+          'The most commonly diagnosed bacterial STIs are **chlamydia** and **gonorrhea**. **HPV** is also very common overall.\n\n' +
+          'Many people have no symptoms, so testing is the best way to know your status.',
+        sources: [
+          { label: 'SmartSexResource - STIs and Conditions', url: 'https://smartsexresource.com/sexually-transmitted-infections/stis-conditions/' },
+          { label: 'STIs at a Glance PDF', url: 'https://smartsexresource.com/wp-content/uploads/resources/STIs-at-a-Glance-pages_October_2024-1.pdf' },
         ],
       };
     }
@@ -1969,20 +2857,21 @@ export function ChatPage() {
          lowerQuery === "don't think so" || lowerQuery === "i don't think so" || lowerQuery === "not really") &&
         messages.length > 2) { // Only if in conversation context
       return {
-        content: `**Okay - since you don't have symptoms, you can choose GetCheckedOnline**, BC CDC's online testing option.\n\nYou create a lab form online and visit a participating LifeLabs for samples. No ID needed.\n\nWould you like to:\n\n1. **Start with GetCheckedOnline**\n2. **Find a nearby clinic**\n3. **Create a patient summary note**`,
+        content: `**Okay - since you don't have symptoms, GetCheckedOnline can be a good option.**\n\nYou create a lab form online and visit a participating LifeLabs for samples.\n\n**How often to test (general):**\n- Usually every **3-12 months**\n- If you/partners have new or casual partners, every **3-6 months** is common\n- Testing monthly is usually not recommended\n\n**After a specific exposure:** testing is often done around **3 weeks** and again at **3 months**.\n\nWould you like to:\n\n1. **Start with GetCheckedOnline**\n2. **Find a nearby clinic**\n3. **Create a patient summary note**`,
         sources: [
           { label: 'GetCheckedOnline', url: 'https://getcheckedonline.com' },
-          { label: 'HealthLinkBC - Sexual Health', url: 'https://www.healthlinkbc.ca/healthwise/birth-control' },
+          { label: 'HealthLinkBC - Sexual Health', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
           { label: 'Pathways BC - Sexual Health Clinics', url: 'https://vancouver.pathwaysbc.ca/programs/1286' }
         ]
       };
     }
     
     // CHECK FOR "I THINK I HAVE AN STI" - PRIORITY CONCERN
-    if ((lowerQuery.includes('think') || lowerQuery.includes('might') || lowerQuery.includes('maybe') || lowerQuery.includes('worried')) && 
+    if ((lowerQuery.includes('think') || lowerQuery.includes('might') || lowerQuery.includes('maybe') || lowerQuery.includes('worried') || lowerQuery.includes('concerned') || lowerQuery.includes('anxious') || lowerQuery.includes('scared')) && 
         (lowerQuery.includes('have') || lowerQuery.includes('got')) && 
         (lowerQuery.includes('sti') || lowerQuery.includes('std') || lowerQuery.includes('infection'))) {
       setTriageStage('symptomCheck');
+      setTriageLock(true);
       setSymptomStatus(null);
       return {
         content:
@@ -2013,10 +2902,12 @@ export function ChatPage() {
       (lowerQuery.includes('anal') && lowerQuery.includes('sex'))
     ) {
       setTriageStage('symptomCheck');
+      setTriageLock(true);
       return {
         content:
           '**Thanks for sharing that.**\n\n' +
-          'That can be a reason to consider STI testing, even if you feel okay.\n\n' +
+          'That can be a reason to consider STI testing, even if you feel okay.\n' +
+          'If you stay without symptoms, online testing is often used around **3 weeks** and again at **3 months** after contact.\n\n' +
           '**Quick check:** do you have any symptoms right now (burning when peeing, discharge, sores, rash, or itching)?\n\n' +
           'Reply **"yes"**, **"no"**, or **"not sure"** and I will guide your next step.',
         sources: [
@@ -2035,7 +2926,7 @@ export function ChatPage() {
          lowerQuery.includes('chlamydia') || lowerQuery.includes('gonorrhea') || lowerQuery.includes('syphilis') || 
          lowerQuery.includes('herpes') || lowerQuery.includes('hpv') || lowerQuery.includes('hiv'))) {
       return {
-        content: `**I'm here to support you.**\n\nIt takes courage to reach out. Let me help you figure out what to do next.\n\nFirst - **do you know which STI your partner was diagnosed with?**\n\n(Different STIs have different testing timelines, so this helps me give you the right guidance. If you're not sure, that's okay - just let me know.)`,
+        content: `**I'm here to support you.**\n\nIt takes courage to reach out. Let me help you figure out what to do next.\n\nBecause you had sex with someone who has an STI, it's best to **see a health care provider** rather than relying only on online testing.\n\nFirst - **do you know which STI your partner was diagnosed with?**\n\n(Different STIs have different testing timelines, so this helps me give you the right guidance. If you're not sure, that's okay - just let me know.)`,
         sources: [
           { label: 'SmartSexResource - Partner Notification', url: 'https://smartsexresource.com/sexually-transmitted-infections/partner-notification/' },
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }
@@ -2052,6 +2943,7 @@ export function ChatPage() {
          lowerQuery.includes('how to know if i have')) && 
         (lowerQuery.includes('sti') || lowerQuery.includes('std') || lowerQuery.includes('infection'))) {
       setTriageStage('symptomCheck');
+      setTriageLock(true);
       setSymptomStatus(null);
       return {
         content:
@@ -2149,6 +3041,31 @@ export function ChatPage() {
     
     // Testing-related queries (short + interactive)
     if (lowerQuery.includes('test') || lowerQuery.includes('testing')) {
+      if (lowerQuery.includes('how often') || lowerQuery.includes('frequency') || lowerQuery.includes('regularly')) {
+        return {
+          content:
+            '**How often should I test?**\n\n' +
+            '- A common routine is every **3-12 months**\n' +
+            '- If you or partners have new/casual partners, every **3-6 months** can make sense\n' +
+            '- Testing more often than every 3 months (for example monthly) is usually not recommended\n\n' +
+            '**GetCheckedOnline is usually a good option when:**\n' +
+            '- It is part of your regular STI screening routine\n' +
+            '- You had a change in sexual behaviours\n' +
+            '- You are testing after a sexual contact (often around **3 weeks** and **3 months**)\n\n' +
+            '**See a health care provider when:**\n' +
+            '- You have symptoms (discharge, pain, itching, sores)\n' +
+            '- You had sex with someone who has an STI\n' +
+            '- You need tests GetCheckedOnline does not offer\n' +
+            '- You want support after sexual assault\n' +
+            '- You need a printed result with your name on it',
+          sources: [
+            { label: 'GetCheckedOnline', url: 'https://getcheckedonline.com' },
+            { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
+            { label: 'SmartSexResource - Testing', url: 'https://smartsexresource.com/testing/' },
+          ],
+        };
+      }
+
       // Recent exposure / risky behaviour
       if (
         (lowerQuery.includes('new partner') ||
@@ -2201,8 +3118,11 @@ export function ChatPage() {
       return {
         content:
           '**STI testing options in BC**\n\n' +
-          '- **No symptoms?** Online testing through GetCheckedOnline can work well.\n' +
-          '- **Have symptoms?** It is better to see a sexual health clinic in person.\n\n' +
+          '- **No symptoms?** GetCheckedOnline can work well for routine screening and behaviour-change follow-up.\n' +
+          '- **Have symptoms or partner known STI?** It is better to see a sexual health clinic/provider in person.\n' +
+          '- **After exposure:** many people test around **3 weeks** and again at **3 months**.\n' +
+          '- **How often:** usually every **3-12 months** (every **3-6 months** if higher risk; monthly is usually not needed).\n\n' +
+          'See a provider if you need tests not offered online, support after sexual assault, or a printed named result.\n\n' +
           'You can type **"GetCheckedOnline"**, **"find a clinic"**, or tell me more about your situation.',
         sources: [
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
@@ -2260,7 +3180,7 @@ export function ChatPage() {
           '- Regular testing and honest talks with partners\n\n' +
           'Is there one method you want to know more about (condoms, PrEP, vaccines, or something else)?',
         sources: [
-          { label: 'SmartSexResource - Prevention', url: 'https://smartsexresource.com/prevention/' },
+          { label: 'SmartSexResource - Safer Sex', url: 'https://smartsexresource.com/sexually-transmitted-infections/sti-basics/safer-sex/' },
           { label: 'STIs at a Glance PDF', url: 'https://smartsexresource.com/wp-content/uploads/resources/STIs-at-a-Glance-pages_October_2024-1.pdf' }
         ]
       };
@@ -2275,6 +3195,23 @@ export function ChatPage() {
         ((lowerQuery.includes('miss') || lowerQuery.includes('forgot')) && lowerQuery.includes('pill')) ||
         (lowerQuery.includes('hormonal') && (lowerQuery.includes('method') || lowerQuery.includes('option')))) {
 
+      // Missed pill guidance
+      if ((lowerQuery.includes('miss') || lowerQuery.includes('forgot')) && lowerQuery.includes('pill')) {
+        return {
+          content:
+            '**Missed birth control pill - what to do**\n\n' +
+            '- Take the missed pill as soon as you remember.\n' +
+            '- Then take your next pill at the usual time (this can mean 2 pills in one day).\n' +
+            '- Use condoms until you have taken active pills for at least 7 days in a row.\n' +
+            '- If unprotected sex happened after missed pills, emergency contraception may help.\n\n' +
+            'If you want, I can help step-by-step based on how many pills were missed and when sex happened.',
+          sources: [
+            { label: 'HealthLinkBC File #91a - Hormonal Contraception', url: 'https://www.healthlinkbc.ca/healthlinkbc-files/hormonal-contraception' },
+            { label: 'HealthLinkBC - Emergency Contraception', url: 'https://www.healthlinkbc.ca/health-topics/emergency-contraception' },
+          ]
+        };
+      }
+
       // IUD type question (must come before generic "types of contraception")
       if (
         (lowerQuery.includes('iud') || lowerQuery.includes('intrauterine')) &&
@@ -2288,8 +3225,8 @@ export function ChatPage() {
             'Both are highly effective, long-acting, and reversible. The best choice depends on your period pattern, side effect preferences, and medical history.\n\n' +
             'If you want, I can compare hormonal vs copper IUDs in a quick side-by-side format.',
           sources: [
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' },
-            { label: 'HealthLinkBC - IUD', url: 'https://www.healthlinkbc.ca/healthwise/birth-control-iud-intrauterine-device' }
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+            { label: 'HealthLinkBC - IUD', url: 'https://www.healthlinkbc.ca/health-topics/intrauterine-device-iud-birth-control' }
           ]
         };
       }
@@ -2300,8 +3237,15 @@ export function ChatPage() {
         lowerQuery.includes('types of contraception') ||
         lowerQuery.includes('what are different types') ||
         lowerQuery.includes('what types') ||
+        lowerQuery.includes('different methods') ||
+        lowerQuery.includes('methods of birth control') ||
+        lowerQuery.includes('methods of contraception') ||
+        lowerQuery.includes('what methods') ||
+        lowerQuery.includes('what kinds') ||
+        lowerQuery.includes('kinds of birth control') ||
         lowerQuery.includes('options of contraception') ||
-        lowerQuery.includes('contraception options')
+        lowerQuery.includes('contraception options') ||
+        lowerQuery.includes('birth control options')
       ) {
         return {
           content:
@@ -2313,8 +3257,8 @@ export function ChatPage() {
             '- **Permanent methods:** vasectomy, tubal sterilization\n\n' +
             'If you want, I can compare these by effectiveness, side effects, and cost in BC.',
           sources: [
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' },
-            { label: 'HealthLinkBC - Hormonal Methods', url: 'https://www.healthlinkbc.ca/healthwise/hormonal-methods-birth-control' }
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+            { label: 'HealthLinkBC - Hormonal Methods', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }
           ]
         };
       }
@@ -2335,8 +3279,28 @@ export function ChatPage() {
             '- **Condoms** are important for STI protection, but are less effective for pregnancy prevention alone.\n\n' +
             'If you want, I can help compare options by effectiveness, side effects, and how long they last.',
           sources: [
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' },
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
             { label: 'SmartSexResource - Safer Sex', url: 'https://smartsexresource.com/sexually-transmitted-infections/sti-basics/safer-sex/' }
+          ]
+        };
+      }
+
+      // Pill effectiveness question
+      if (
+        (lowerQuery.includes('birth control') || lowerQuery.includes('contraception')) &&
+        (lowerQuery.includes('effective') || lowerQuery.includes('effectiveness') || lowerQuery.includes('how effective')) &&
+        !lowerQuery.includes('pill')
+      ) {
+        return {
+          content:
+            '**How effective is birth control overall?**\n\n' +
+            '- **Most effective:** IUDs and implants (over 99%).\n' +
+            '- **Pill/patch/ring/shot:** effective, but lower with typical use than with perfect use.\n' +
+            '- **Condoms:** help prevent pregnancy and also reduce STI risk, but pregnancy prevention alone is less effective than LARC methods.\n\n' +
+            'If you want, I can compare methods side-by-side for effectiveness and side effects.',
+          sources: [
+            { label: 'HealthLinkBC - Effectiveness Rate of Birth Control Methods', url: 'https://www.healthlinkbc.ca/healthwise/effectiveness-rate-birth-control-methods' },
+            { label: 'HealthLinkBC - IUD (Intrauterine Device)', url: 'https://www.healthlinkbc.ca/healthwise/intrauterine-device-iud-birth-control' },
           ]
         };
       }
@@ -2355,8 +3319,8 @@ export function ChatPage() {
             '- The pill does **not** protect against STIs, so condoms are still important.\n\n' +
             'If you want, I can explain how to make pill use more effective or compare it with IUD/implant.',
           sources: [
-            { label: 'HealthLinkBC - Birth Control Pills', url: 'https://www.healthlinkbc.ca/healthwise/birth-control-hormones-pill' },
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }
+            { label: 'HealthLinkBC - Birth Control Pills', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-pill' },
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }
           ]
         };
       }
@@ -2384,7 +3348,7 @@ export function ChatPage() {
             'The sooner you take EC after sex, the better it works. Do you want help **finding a clinic or pharmacy**, or to know **which option might fit you**?',
           sources: [
             { label: 'HealthLinkBC - Emergency Contraception', url: 'https://www.healthlinkbc.ca/healthlinkbc-files/emergency-contraception' },
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }
           ]
         };
       }
@@ -2400,8 +3364,8 @@ export function ChatPage() {
             '- **Copper IUD** - no hormones, lasts up to 10 years, can also be used as emergency contraception\n\n' +
             'Both are over 99% effective. They must be put in and taken out by a clinician. Do you want help **finding a clinic** or knowing **which type might fit you**?',
           sources: [
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/healthwise/birth-control' },
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }
           ]
         };
       }
@@ -2417,8 +3381,8 @@ export function ChatPage() {
             '- It does **not** protect against STIs, so condoms may still be needed.\n\n' +
             'If you want, I can compare the ring with the pill, patch, IUD, or implant.',
           sources: [
-            { label: 'HealthLinkBC - Birth Control Ring', url: 'https://www.healthlinkbc.ca/healthwise/birth-control-hormones-ring' },
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }
+            { label: 'HealthLinkBC - Birth Control Ring', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-ring' },
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }
           ]
         };
       }
@@ -2435,8 +3399,8 @@ export function ChatPage() {
             '- Does **not** protect against STIs - you still need condoms for STI protection\n\n' +
             'Do you want to talk about **how to start the pill**, **side effects**, or **what to do if you miss a pill**?',
           sources: [
-            { label: 'HealthLinkBC - Birth Control Pills', url: 'https://www.healthlinkbc.ca/healthwise/birth-control-hormones-pill' },
-            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }
+            { label: 'HealthLinkBC - Birth Control Pills', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-pill' },
+            { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }
           ]
         };
       }
@@ -2451,9 +3415,9 @@ export function ChatPage() {
           '- **Emergency contraception**: Used after sex if something went wrong\n\n' +
           'Is there one method you would like to focus on (IUD, pill, condoms, emergency contraception)?',
         sources: [
-          { label: 'HealthLinkBC - Hormonal Birth Control', url: 'https://www.healthlinkbc.ca/healthwise/hormonal-methods-birth-control' },
-          { label: 'HealthLinkBC - Birth Control Overview', url: 'https://www.healthlinkbc.ca/healthwise/birth-control' },
-          { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }
+          { label: 'HealthLinkBC - Hormonal Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+          { label: 'HealthLinkBC - Birth Control Overview', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+          { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }
         ]
       };
     }
@@ -2475,7 +3439,7 @@ export function ChatPage() {
           'If you want, I can help with next steps based on when sex happened.',
         sources: [
           { label: 'HealthLinkBC - Pregnancy Tests', url: 'https://www.healthlinkbc.ca/healthwise/pregnancy-tests' },
-          { label: 'HealthLinkBC - Family Planning', url: 'https://www.healthlinkbc.ca/living-well/family-planning-pregnancy-and-childbirth/birth-control' }
+          { label: 'HealthLinkBC - Family Planning', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' }
         ]
       };
     }
@@ -2620,8 +3584,8 @@ export function ChatPage() {
     const summary = generatePatientSummary(formData);
     setSummaryFormData(formData);
     setSummaryData(summary);
-    localStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(formData));
-    localStorage.setItem(SUMMARY_STORAGE_KEY, JSON.stringify(summary));
+    sessionStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(formData));
+    sessionStorage.setItem(SUMMARY_STORAGE_KEY, JSON.stringify(summary));
     setShowSummaryForm(false);
     setShowSummaryView(true);
   };
@@ -2638,8 +3602,9 @@ export function ChatPage() {
   const handleStartNewSummary = () => {
     setSummaryFormData(null);
     setSummaryData(null);
-    localStorage.removeItem(SUMMARY_FORM_STORAGE_KEY);
-    localStorage.removeItem(SUMMARY_STORAGE_KEY);
+    sessionStorage.removeItem(SUMMARY_FORM_STORAGE_KEY);
+    sessionStorage.removeItem(SUMMARY_STORAGE_KEY);
+    localStorage.removeItem(ACCESS_CODE_STORAGE_KEY);
     setShowSummaryView(false);
     setShowSummaryForm(true);
   };
@@ -2648,6 +3613,11 @@ export function ChatPage() {
     setShowSummaryView(false);
     // Navigate to clinic list page
     navigate('/clinics?from=chat&autoLocate=1');
+  };
+
+  const handleGetAccessCode = () => {
+    setShowSummaryView(false);
+    navigate('/share');
   };
 
   const summaryUpdatedLabel = summaryData
@@ -2725,7 +3695,12 @@ export function ChatPage() {
           <Input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                if (!isGenerating) void handleSend();
+              }
+            }}
             placeholder="Ask me anything..."
             className="flex-1"
           />
@@ -2742,8 +3717,8 @@ export function ChatPage() {
 
       {/* Patient Summary Form Overlay */}
       {showSummaryForm && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 overflow-y-auto">
-          <div className="my-8">
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-start justify-center p-4 md:p-6 overflow-y-auto">
+          <div className="my-2 md:my-6 w-full">
             <PatientSummaryForm
               onSubmit={handleSummarySubmit}
               onCancel={() => setShowSummaryForm(false)}
@@ -2762,6 +3737,7 @@ export function ChatPage() {
               onEdit={handleSummaryEdit}
               onClose={handleSummaryClose}
               onFindClinic={handleFindClinic}
+              onGetAccessCode={handleGetAccessCode}
             />
           </div>
         </div>
@@ -2769,6 +3745,7 @@ export function ChatPage() {
     </div>
   );
 }
+
 
 
 

@@ -8,9 +8,10 @@ interface PatientSummaryViewProps {
   onEdit: () => void;
   onClose: () => void;
   onFindClinic?: () => void;
+  onGetAccessCode?: () => void;
 }
 
-export function PatientSummaryView({ data, onEdit, onClose, onFindClinic }: PatientSummaryViewProps) {
+export function PatientSummaryView({ data, onEdit, onClose, onFindClinic, onGetAccessCode }: PatientSummaryViewProps) {
   const [copied, setCopied] = useState(false);
 
   const generateTextSummary = () => {
@@ -165,6 +166,15 @@ SOURCES (BC-APPROVED)
                 className="flex-1 bg-[#00A3A3] hover:bg-[#003366] text-white"
               >
                 Find Nearby Clinic
+              </Button>
+            )}
+            {onGetAccessCode && (
+              <Button
+                onClick={onGetAccessCode}
+                variant="outline"
+                className="flex-1"
+              >
+                Get Access Code
               </Button>
             )}
             <Button
