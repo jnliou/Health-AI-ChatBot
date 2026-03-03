@@ -277,7 +277,7 @@ async function getLLMGeneralResponse(
                 ? `The user's name is ${context.userName}. Use their name naturally when appropriate. `
                 : '') +
               (context?.userAge
-                ? `The user is ${context.userAge} years old. Adapt examples to adults unless asked otherwise. `
+                ? `The user is ${context.userAge} years old. Tailor wording to their age and keep tone non-judgmental. If the user is a teen, use youth-friendly language and reassure confidentiality in health care settings when relevant. `
                 : '') +
               (context?.chatHistoryText
                 ? 'You are given recent chat history. Use it to keep continuity and avoid repeating yourself. '
@@ -397,7 +397,11 @@ function isContraceptionFocusedQuery(query: string): boolean {
   );
 }
 
-function postProcessAssistantContent(query: string, content: string): string {
+function postProcessAssistantContent(
+  query: string,
+  content: string,
+  options?: { hasShownBirthControlDisclaimer?: boolean }
+): string {
   let out = normalizeLlmReply(content);
   if (!out) return out;
 
@@ -407,7 +411,7 @@ function postProcessAssistantContent(query: string, content: string): string {
       .replace(/Hormonal birth control and LARCs \(like IUDs\) do not protect against STIs\.(?! Use condoms for dual protection\.)/gi, '')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
-    if (!out.includes(MANDATORY_BIRTH_CONTROL_DISCLAIMER)) {
+    if (!options?.hasShownBirthControlDisclaimer && !out.includes(MANDATORY_BIRTH_CONTROL_DISCLAIMER)) {
       out = `${out}\n\n${MANDATORY_BIRTH_CONTROL_DISCLAIMER}`.trim();
     }
   }
@@ -416,6 +420,25 @@ function postProcessAssistantContent(query: string, content: string): string {
 }
 
 function normalizeResponseSources(sources: { label: string; url: string }[]): { label: string; url: string }[] {
+  const sanitizeSourceUrl = (url: string): string => {
+    const trimmed = url.trim();
+    try {
+      const parsed = new URL(trimmed);
+      if (!parsed.hostname.includes('healthlinkbc.ca')) return trimmed;
+      const lowerPath = parsed.pathname.toLowerCase();
+      const isSearchLike =
+        lowerPath.includes('/search') ||
+        parsed.searchParams.has('q') ||
+        parsed.searchParams.has('query');
+      if (isSearchLike) {
+        return 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods';
+      }
+      return trimmed;
+    } catch {
+      return trimmed;
+    }
+  };
+
   const cleaned = sources.filter(
     (s) =>
       !!s &&
@@ -425,7 +448,14 @@ function normalizeResponseSources(sources: { label: string; url: string }[]): { 
       /^https?:\/\//i.test(s.url) &&
       !/safety directives/i.test(s.label)
   );
-  return Array.from(new Map(cleaned.map((s) => [s.url, { label: s.label.trim(), url: s.url.trim() }])).values());
+  return Array.from(
+    new Map(
+      cleaned.map((s) => {
+        const normalizedUrl = sanitizeSourceUrl(s.url);
+        return [normalizedUrl, { label: s.label.trim(), url: normalizedUrl }];
+      })
+    ).values()
+  );
 }
 
 function buildResourceFallbackAnswer(query: string, chunks: RagChunk[]): string | null {
@@ -583,6 +613,17 @@ function shouldUseLlmGeneralAnswer(
     (lower.includes('most common sti') || lower.includes('most common std')) ||
     ((lower.includes('common') || lower.includes('most common')) &&
       (lower.includes('sti') || lower.includes('std')));
+  const asksYouthBirthControlAccess =
+    (lower.includes('youth') || lower.includes('teen') || lower.includes('minor') || lower.includes('under 19') || lower.includes('under 18')) &&
+    (lower.includes('birth control') || lower.includes('contraception')) &&
+    (lower.includes('how can i get') ||
+      lower.includes('how do i get') ||
+      lower.includes('where can i get') ||
+      lower.includes('is it free') ||
+      lower.includes('cost') ||
+      lower.includes('pay') ||
+      lower.includes('privacy') ||
+      lower.includes('confidential'));
   const asksGeneralBirthControlEffectiveness =
     (lower.includes('birth control') || lower.includes('contraception')) &&
     (lower.includes('effective') || lower.includes('effectiveness') || lower.includes('how effective'));
@@ -604,7 +645,8 @@ function shouldUseLlmGeneralAnswer(
     asksHowOftenTest ||
     asksWhatIsGonorrhea ||
     asksIudHurt ||
-    asksMostCommonSti
+    asksMostCommonSti ||
+    asksYouthBirthControlAccess
   ) return false;
   if (priorityStiConcern) return false;
   if (clinicCommand || gcoCommand) return false;
@@ -662,6 +704,17 @@ function isFastDeterministicQuery(query: string): boolean {
     (lower.includes('most common sti') || lower.includes('most common std')) ||
     ((lower.includes('common') || lower.includes('most common')) &&
       (lower.includes('sti') || lower.includes('std')));
+  const asksYouthBirthControlAccess =
+    (lower.includes('youth') || lower.includes('teen') || lower.includes('minor') || lower.includes('under 19') || lower.includes('under 18')) &&
+    (lower.includes('birth control') || lower.includes('contraception')) &&
+    (lower.includes('how can i get') ||
+      lower.includes('how do i get') ||
+      lower.includes('where can i get') ||
+      lower.includes('is it free') ||
+      lower.includes('cost') ||
+      lower.includes('pay') ||
+      lower.includes('privacy') ||
+      lower.includes('confidential'));
   const asksGeneralBirthControlEffectiveness =
     (lower.includes('birth control') || lower.includes('contraception')) &&
     (lower.includes('effective') || lower.includes('effectiveness') || lower.includes('how effective'));
@@ -683,7 +736,8 @@ function isFastDeterministicQuery(query: string): boolean {
     asksHowOftenTest ||
     asksWhatIsGonorrhea ||
     asksIudHurt ||
-    asksMostCommonSti
+    asksMostCommonSti ||
+    asksYouthBirthControlAccess
   );
 }
 
@@ -1517,6 +1571,9 @@ export function ChatPage() {
     if (!input.trim()) return;
 
     const currentInput = input.trim();
+    const hasShownBirthControlDisclaimer = messages.some(
+      (m) => m.role === 'assistant' && typeof m.content === 'string' && m.content.includes(MANDATORY_BIRTH_CONTROL_DISCLAIMER)
+    );
     const latestAssistantContent = [...messages]
       .reverse()
       .find((m) => m.role === 'assistant')?.content || '';
@@ -1529,20 +1586,44 @@ export function ChatPage() {
     const legacyNoSymptomPrompt =
       latestAssistantContent.includes('Start with GetCheckedOnline') &&
       latestAssistantContent.includes('Find a nearby clinic');
+    const directClinicOrNotePrompt =
+      latestAssistantContent.includes('1. **Show the closest clinics**') &&
+      latestAssistantContent.includes('2. **Create a patient summary note**');
+    const noSymptomThreeChoicePrompt =
+      latestAssistantContent.includes('1. **Start with GetCheckedOnline**') &&
+      latestAssistantContent.includes('2. **Find a nearby clinic**') &&
+      latestAssistantContent.includes('3. **Create a patient summary note**');
+    const normalizedNumericInput = currentInput.toLowerCase().trim();
+    const wantsOptionOne =
+      normalizedNumericInput === '1' || normalizedNumericInput === '1.' || normalizedNumericInput === 'option 1';
+    const wantsOptionTwo =
+      normalizedNumericInput === '2' || normalizedNumericInput === '2.' || normalizedNumericInput === 'option 2';
+    const wantsOptionThree =
+      normalizedNumericInput === '3' || normalizedNumericInput === '3.' || normalizedNumericInput === 'option 3';
     const normalizedCommandInput =
-      triagePromptHasChoices && (currentInput === '1' || currentInput === '1.')
+      triagePromptHasChoices && wantsOptionOne
         ? 'open clinics'
-        : triagePromptHasChoices && (currentInput === '2' || currentInput === '2.')
+        : triagePromptHasChoices && wantsOptionTwo
           ? 'use this for my note'
-          : asymptomaticQuickChoicePrompt && (currentInput === '1' || currentInput === '1.')
+          : asymptomaticQuickChoicePrompt && wantsOptionOne
             ? 'getcheckedonline'
-            : asymptomaticQuickChoicePrompt && (currentInput === '2' || currentInput === '2.')
+            : asymptomaticQuickChoicePrompt && wantsOptionTwo
               ? 'open clinics'
-              : legacyNoSymptomPrompt && (currentInput === '1' || currentInput === '1.')
+              : directClinicOrNotePrompt && wantsOptionOne
+                ? 'open clinics'
+                : directClinicOrNotePrompt && wantsOptionTwo
+                  ? 'use this for my note'
+                  : noSymptomThreeChoicePrompt && wantsOptionOne
+                    ? 'getcheckedonline'
+                    : noSymptomThreeChoicePrompt && wantsOptionTwo
+                      ? 'open clinics'
+                      : noSymptomThreeChoicePrompt && wantsOptionThree
+                        ? 'use this for my note'
+              : legacyNoSymptomPrompt && wantsOptionOne
                 ? 'getcheckedonline'
-                : legacyNoSymptomPrompt && (currentInput === '2' || currentInput === '2.')
+                : legacyNoSymptomPrompt && wantsOptionTwo
                   ? 'find a clinic'
-                  : legacyNoSymptomPrompt && (currentInput === '3' || currentInput === '3.')
+                  : legacyNoSymptomPrompt && wantsOptionThree
                     ? 'use this for my note'
                     : currentInput;
 
@@ -1561,7 +1642,9 @@ export function ChatPage() {
       const assistantMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: postProcessAssistantContent(normalizedCommandInput, direct.content),
+        content: postProcessAssistantContent(normalizedCommandInput, direct.content, {
+          hasShownBirthControlDisclaimer,
+        }),
         sources: normalizeResponseSources(direct.sources),
         timestamp: new Date(),
       };
@@ -1574,7 +1657,9 @@ export function ChatPage() {
       const assistantMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: postProcessAssistantContent(normalizedCommandInput, direct.content),
+        content: postProcessAssistantContent(normalizedCommandInput, direct.content, {
+          hasShownBirthControlDisclaimer,
+        }),
         sources: normalizeResponseSources(direct.sources),
         timestamp: new Date(),
       };
@@ -1647,7 +1732,9 @@ export function ChatPage() {
           timeoutMs: birthControlBasics ? 24000 : undefined,
         });
         if (llmGeneral) {
-          content = postProcessAssistantContent(currentInput, llmGeneral);
+          content = postProcessAssistantContent(currentInput, llmGeneral, {
+            hasShownBirthControlDisclaimer,
+          });
           responseSources =
             ragChunks.length > 0
               ? Array.from(
@@ -1668,7 +1755,9 @@ export function ChatPage() {
           });
 
           if (llmHealthRetry) {
-            content = postProcessAssistantContent(currentInput, llmHealthRetry);
+            content = postProcessAssistantContent(currentInput, llmHealthRetry, {
+              hasShownBirthControlDisclaimer,
+            });
             responseSources = Array.from(
               new Map(
                 ragChunks.map((c) => [c.sourceUrl, { label: c.sourceLabel, url: c.sourceUrl }])
@@ -1693,7 +1782,9 @@ export function ChatPage() {
             chatHistoryText: buildRecentHistoryText(messages, currentInput),
           });
           if (llmRetry) {
-            content = postProcessAssistantContent(currentInput, llmRetry);
+            content = postProcessAssistantContent(currentInput, llmRetry, {
+              hasShownBirthControlDisclaimer,
+            });
             responseSources = [];
           } else if (detectedAge) {
             const name = detectedName || userName;
@@ -1719,7 +1810,9 @@ export function ChatPage() {
       const assistantMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: postProcessAssistantContent(currentInput, content),
+        content: postProcessAssistantContent(currentInput, content, {
+          hasShownBirthControlDisclaimer,
+        }),
         sources: normalizeResponseSources(responseSources),
         timestamp: new Date(),
       };
@@ -2502,12 +2595,12 @@ export function ChatPage() {
     }
 
     const triagePromptedOpenClinics =
-      (lowerQuery === '1' || lowerQuery === '1.') &&
+      (lowerQuery === '1' || lowerQuery === '1.' || lowerQuery === 'option 1') &&
       messages.length > 0 &&
       messages[messages.length - 1]?.content.includes('Type **"open clinics"**');
 
     const triagePromptedGetCheckedOnline =
-      (lowerQuery === '1' || lowerQuery === '1.') &&
+      (lowerQuery === '1' || lowerQuery === '1.' || lowerQuery === 'option 1') &&
       messages.length > 0 &&
       messages[messages.length - 1]?.content.includes('Type **"GetCheckedOnline"**');
 
@@ -2575,8 +2668,36 @@ export function ChatPage() {
           '- **Permanent:** tubal ligation, vasectomy\n\n' +
           'Most methods prevent pregnancy, but only condoms help protect against STIs. Want a quick comparison by effectiveness?',
         sources: [
-          { label: 'HealthLinkBC - Birth Control Overview', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
-          { label: 'HealthLinkBC - Barrier Methods', url: 'https://www.healthlinkbc.ca/health-topics/barrier-methods-birth-control' },
+          { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/healthwise/birth-control' },
+        ],
+      };
+    }
+
+    if (
+      (lowerQuery.includes('birth control') || lowerQuery.includes('contraception')) &&
+      (lowerQuery.includes('how can i get') ||
+        lowerQuery.includes('how do i get') ||
+        lowerQuery.includes('where can i get') ||
+        lowerQuery.includes('is it free') ||
+        lowerQuery.includes('cost') ||
+        lowerQuery.includes('pay') ||
+        lowerQuery.includes('privacy') ||
+        lowerQuery.includes('confidential'))
+    ) {
+      return {
+        content:
+          '**Yes. In BC, many prescription birth control options are free if you are enrolled in MSP, including for youth.**\n\n' +
+          '**How to get it as a youth:**\n' +
+          '- You can speak with a doctor, walk-in clinic, youth clinic, or pharmacist.\n' +
+          '- Bring your BC Services Card/Personal Health Number.\n' +
+          '- Ask what methods are covered.\n\n' +
+          '**Privacy:** You can get sexual health care on your own. Your visit is confidential, and parents are not automatically notified.\n\n' +
+          'If you want, I can help you choose a method and show youth-friendly clinics.',
+        sources: [
+          {
+            label: 'HealthLinkBC - Birth Control for Teens',
+            url: 'https://www.healthlinkbc.ca/healthwise/birth-control-teens',
+          },
         ],
       };
     }
@@ -2588,18 +2709,33 @@ export function ChatPage() {
       return {
         content:
           '**Different types of birth control**\n\n' +
-          '- **Pill** (daily)\n' +
-          '- **Patch** (weekly)\n' +
-          '- **Ring** (monthly)\n' +
-          '- **Shot** (every 3 months)\n' +
-          '- **IUD** (3-10 years, depending on type)\n' +
-          '- **Implant** (up to 3 years)\n' +
-          '- **Condoms/internal condoms** (every sex act)\n' +
-          '- **Emergency contraception** (after unprotected sex)\n\n' +
-          'Most hormonal/LARC options are very effective for pregnancy prevention. Condoms are still needed for STI protection.',
+          '**Hormonal methods:** pill, patch, shot (Depo-Provera), vaginal ring, implant.\n\n' +
+          '**Long-acting reversible contraception (LARC):** IUDs (hormonal or copper).\n\n' +
+          '**Barrier methods:** external condoms, internal condoms, diaphragms, spermicides.\n\n' +
+          '**Permanent methods:** tubal ligation and vasectomy.',
         sources: [
-          { label: 'HealthLinkBC - Birth Control Overview', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
-          { label: 'HealthLinkBC - IUD', url: 'https://www.healthlinkbc.ca/health-topics/intrauterine-device-iud-birth-control' },
+          { label: 'HealthLinkBC - Birth Control', url: 'https://www.healthlinkbc.ca/healthwise/birth-control' },
+        ],
+      };
+    }
+
+    if (
+      (lowerQuery.includes('what is the pill') ||
+        lowerQuery.includes('what is pill') ||
+        lowerQuery.includes('tell me about the pill') ||
+        lowerQuery.includes('how effective is the pill') ||
+        (lowerQuery.includes('pill') && lowerQuery.includes('effective'))) &&
+      (lowerQuery.includes('what') || lowerQuery.includes('how'))
+    ) {
+      return {
+        content:
+          '**The pill** is a daily hormone medication that helps prevent pregnancy, mainly by stopping ovulation.\n\n' +
+          '**Effectiveness:**\n' +
+          '- **Perfect use:** about **99%** effective\n' +
+          '- **Typical use:** about **91%** effective\n\n' +
+          'It works best when taken every day at the same time.',
+        sources: [
+          { label: 'HealthLinkBC - Birth Control Pill', url: 'https://www.healthlinkbc.ca/healthwise/birth-control-hormones-pill' },
         ],
       };
     }
@@ -2631,12 +2767,11 @@ export function ChatPage() {
       return {
         content:
           '**How effective is the pill?**\n\n' +
-          '- With **typical use**: about **93% effective**\n' +
-          '- With **perfect use**: over **99% effective**\n\n' +
+          '- With **perfect use**: about **99% effective**\n' +
+          '- With **typical use**: about **91% effective**\n\n' +
           'Missing pills lowers protection. Using condoms too gives STI protection and extra pregnancy prevention.',
         sources: [
-          { label: 'HealthLinkBC - The Pill (Combined)', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-pill' },
-          { label: 'HealthLinkBC - The Mini-Pill', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-hormones-mini-pill' },
+          { label: 'HealthLinkBC - Birth Control Pill', url: 'https://www.healthlinkbc.ca/healthwise/birth-control-hormones-pill' },
         ],
       };
     }
@@ -2653,13 +2788,16 @@ export function ChatPage() {
       return {
         content:
           '**Different types of STIs**\n\n' +
-          '- **Bacterial:** chlamydia, gonorrhea, syphilis\n' +
-          '- **Viral:** HIV, herpes (HSV), HPV, hepatitis B/C\n' +
-          '- **Parasitic/protozoal:** trichomoniasis\n\n' +
-          'Some STIs are curable (for example chlamydia, gonorrhea, syphilis). Others are manageable long-term (for example HIV, herpes). Many STIs can have no symptoms, so testing is important.',
+          '- Chlamydia\n' +
+          '- Gonorrhea\n' +
+          '- Syphilis\n' +
+          '- Herpes (HSV)\n' +
+          '- HPV\n' +
+          '- HIV\n\n' +
+          '**Most common in BC:** chlamydia is the most commonly reported STI.\n\n' +
+          'Many STIs have no symptoms, so testing is important.',
         sources: [
           { label: 'SmartSexResource - STIs and Conditions', url: 'https://smartsexresource.com/sexually-transmitted-infections/stis-conditions/' },
-          { label: 'STIs at a Glance PDF', url: 'https://smartsexresource.com/wp-content/uploads/resources/STIs-at-a-Glance-pages_October_2024-1.pdf' },
         ],
       };
     }
@@ -2674,14 +2812,11 @@ export function ChatPage() {
       return {
         content:
           '**What is gonorrhea (the clap)?**\n\n' +
-          'Gonorrhea is a common bacterial STI. It can infect the genitals, rectum, and throat.\n\n' +
-          '**Common symptoms:** burning when peeing, discharge, pelvic/testicular pain. Many people have no symptoms.\n\n' +
-          '**Testing:** urine sample or swab (site depends on exposure).\n' +
-          '**Treatment:** antibiotics. Partners should also be tested and treated.\n\n' +
-          'If symptoms are present, in-person care is recommended.',
+          'Gonorrhea is a bacterial infection spread through vaginal, oral, or anal sex.\n\n' +
+          '**Symptoms:** many people have no symptoms. If symptoms happen, they can include painful urination or unusual discharge.\n\n' +
+          '**Treatment:** gonorrhea is curable with antibiotics, and treatment is available through clinics in BC.',
         sources: [
           { label: 'SmartSexResource - Gonorrhea', url: 'https://smartsexresource.com/sexually-transmitted-infections/stis-conditions/gonorrhea/' },
-          { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
         ],
       };
     }
@@ -2693,15 +2828,11 @@ export function ChatPage() {
       return {
         content:
           '**Do IUDs hurt?**\n\n' +
-          'Insertion can be uncomfortable, often like strong period cramps for a short time. Pain level varies by person.\n\n' +
-          '**What can help:**\n' +
-          '- Ask about pain-control options before insertion\n' +
-          '- Take recommended pain medication beforehand (if advised)\n' +
-          '- Plan a lighter day afterward\n\n' +
-          'Many people feel better within hours to a day. If severe pain continues, seek medical care.',
+          'An IUD is a small T-shaped device placed in the uterus by a healthcare provider.\n\n' +
+          'Most people feel discomfort, pinching, or cramping during insertion.\n\n' +
+          '**Pain management:** ask your provider about taking ibuprofen before the visit or using a local anesthetic (numbing).',
         sources: [
-          { label: 'HealthLinkBC - IUD', url: 'https://www.healthlinkbc.ca/health-topics/intrauterine-device-iud-birth-control' },
-          { label: 'SmartSexResource - Birth Control', url: 'https://smartsexresource.com' },
+          { label: 'HealthLinkBC - IUD', url: 'https://www.healthlinkbc.ca/healthwise/intrauterine-device-iud-birth-control' },
         ],
       };
     }
@@ -2715,11 +2846,10 @@ export function ChatPage() {
       return {
         content:
           '**What is the most common STI?**\n\n' +
-          'The most commonly diagnosed bacterial STIs are **chlamydia** and **gonorrhea**. **HPV** is also very common overall.\n\n' +
+          'In British Columbia, **chlamydia** is the most commonly reported STI.\n\n' +
           'Many people have no symptoms, so testing is the best way to know your status.',
         sources: [
           { label: 'SmartSexResource - STIs and Conditions', url: 'https://smartsexresource.com/sexually-transmitted-infections/stis-conditions/' },
-          { label: 'STIs at a Glance PDF', url: 'https://smartsexresource.com/wp-content/uploads/resources/STIs-at-a-Glance-pages_October_2024-1.pdf' },
         ],
       };
     }
@@ -2831,7 +2961,7 @@ export function ChatPage() {
       return {
         content: `**Thanks - it's totally normal not to be sure.**\n\nLet's figure this out together.\n\nThe BC CDC notes that you should get tested if you notice **changes in your body**, have a **new partner**, had **sex without a condom**, or were exposed to a partner with an STI.\n\n**Here are a few common symptoms people sometimes miss:**\n- Burning or pain when you pee\n- Itching or irritation\n- New discharge\n- Sores, bumps, or rashes\n- Pelvic or lower abdominal pain\n\n**Do any of these sound familiar?**\n\n(You can say "maybe", "some", "none", or describe anything you've noticed.)`,
         sources: [
-          { label: 'BC CDC - STI Testing Guidance', url: 'https://www.bccnm.ca/bccnm/Announcements/Pages/Announcement.aspx?AnnouncementID=431' },
+          { label: 'SmartSexResource - STI Symptoms', url: 'https://smartsexresource.com/sexually-transmitted-infections/stis-conditions/' },
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }
         ]
       };
@@ -2860,7 +2990,7 @@ export function ChatPage() {
         content: `**Okay - since you don't have symptoms, GetCheckedOnline can be a good option.**\n\nYou create a lab form online and visit a participating LifeLabs for samples.\n\n**How often to test (general):**\n- Usually every **3-12 months**\n- If you/partners have new or casual partners, every **3-6 months** is common\n- Testing monthly is usually not recommended\n\n**After a specific exposure:** testing is often done around **3 weeks** and again at **3 months**.\n\nWould you like to:\n\n1. **Start with GetCheckedOnline**\n2. **Find a nearby clinic**\n3. **Create a patient summary note**`,
         sources: [
           { label: 'GetCheckedOnline', url: 'https://getcheckedonline.com' },
-          { label: 'HealthLinkBC - Sexual Health', url: 'https://www.healthlinkbc.ca/health-topics/birth-control-pros-and-cons-hormonal-methods' },
+          { label: 'SmartSexResource - Testing', url: 'https://smartsexresource.com/testing/' },
           { label: 'Pathways BC - Sexual Health Clinics', url: 'https://vancouver.pathwaysbc.ca/programs/1286' }
         ]
       };
@@ -2875,8 +3005,9 @@ export function ChatPage() {
       setSymptomStatus(null);
       return {
         content:
-          '**I am glad you reached out - feeling worried about STIs is very common.**\n\n' +
+          '**I am really glad you reached out - feeling worried about STIs is very common, and you are not alone.**\n\n' +
           'I cannot diagnose you, but I can help with next steps.\n\n' +
+          'To guide you safely, I will ask a few short triage questions.\n\n' +
           '**First question:** Are you having any symptoms right now, like:\n' +
           '- Burning or pain when you pee\n' +
           '- New discharge\n' +
@@ -3044,24 +3175,12 @@ export function ChatPage() {
       if (lowerQuery.includes('how often') || lowerQuery.includes('frequency') || lowerQuery.includes('regularly')) {
         return {
           content:
-            '**How often should I test?**\n\n' +
-            '- A common routine is every **3-12 months**\n' +
-            '- If you or partners have new/casual partners, every **3-6 months** can make sense\n' +
-            '- Testing more often than every 3 months (for example monthly) is usually not recommended\n\n' +
-            '**GetCheckedOnline is usually a good option when:**\n' +
-            '- It is part of your regular STI screening routine\n' +
-            '- You had a change in sexual behaviours\n' +
-            '- You are testing after a sexual contact (often around **3 weeks** and **3 months**)\n\n' +
-            '**See a health care provider when:**\n' +
-            '- You have symptoms (discharge, pain, itching, sores)\n' +
-            '- You had sex with someone who has an STI\n' +
-            '- You need tests GetCheckedOnline does not offer\n' +
-            '- You want support after sexual assault\n' +
-            '- You need a printed result with your name on it',
+            '**How often should I get tested?**\n\n' +
+            '- Test every **3 to 12 months** if you have a new partner or more than one partner.\n' +
+            '- Test sooner if you have symptoms.\n' +
+            '- Test if a partner tells you they have an STI.',
           sources: [
-            { label: 'GetCheckedOnline', url: 'https://getcheckedonline.com' },
-            { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
-            { label: 'SmartSexResource - Testing', url: 'https://smartsexresource.com/testing/' },
+            { label: 'SmartSexResource - STI Checklist', url: 'https://smartsexresource.com/clinics-testing/#sti-checklist' },
           ],
         };
       }

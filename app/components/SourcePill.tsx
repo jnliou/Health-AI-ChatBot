@@ -6,6 +6,7 @@ interface SourcePillProps {
 }
 
 export function SourcePill({ label, url }: SourcePillProps) {
+  const displayLabel = label.length > 42 ? `${label.slice(0, 39)}...` : label;
   return (
     <a
       href={url}
@@ -16,7 +17,7 @@ export function SourcePill({ label, url }: SourcePillProps) {
       className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded-full bg-teal-100 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300 hover:bg-teal-200 dark:hover:bg-teal-900/50 transition-colors"
     >
       <ExternalLink className="w-3 h-3" />
-      <span>[Source]</span>
+      <span>{displayLabel}</span>
     </a>
   );
 }

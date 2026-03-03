@@ -1,0 +1,40 @@
+﻿[
+  {
+    "id": "bc_types_1",
+    "prompt": "What types of contraceptives are there?",
+    "must_include_any": ["iud", "pill", "patch", "ring", "shot", "implant", "condom"],
+    "must_include_all": ["birth control"],
+    "must_not_include": ["th control", "nt pregnancy", "birth controlhow"],
+    "source_must_include_any": ["healthlinkbc.ca"]
+  },
+  {
+    "id": "bc_types_2",
+    "prompt": "What types of birth control are there?",
+    "must_include_any": ["iud", "pill", "patch", "ring", "shot", "implant", "condom"],
+    "must_not_include": ["th control", "nt pregnancy", "birth controlhow"],
+    "source_must_include_any": ["healthlinkbc.ca"]
+  },
+  {
+    "id": "bc_start_1",
+    "prompt": "When can I start taking birth control?",
+    "must_include_any": ["start", "today", "first day", "within", "when"],
+    "must_include_all": ["condom"],
+    "must_not_include": ["th control", "nt pregnancy"],
+    "source_must_include_any": ["healthlinkbc.ca"]
+  },
+  {
+    "id": "bc_effective_1",
+    "prompt": "How effective is the birth control pill?",
+    "must_include_all": ["typical", "perfect"],
+    "must_include_any": ["91", "99"],
+    "must_not_include": ["th control", "nt pregnancy"],
+    "source_must_include_any": ["healthlinkbc.ca"]
+  },
+  {
+    "id": "bc_emergency_1",
+    "prompt": "Condom broke last night, what should I do?",
+    "must_include_any": ["emergency contraception", "plan b", "copper iud"],
+    "must_include_all": ["days"],
+    "source_must_include_any": ["healthlinkbc.ca"]
+  }
+]

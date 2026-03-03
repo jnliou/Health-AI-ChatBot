@@ -1,11 +1,53 @@
 // Patient Summary Types for Clinic Handoff
 
+export interface FhirIdentifier {
+  system?: string;
+  value?: string;
+}
+
+export interface FhirReference {
+  reference?: string;
+  display?: string;
+}
+
+export interface FhirCoding {
+  system?: string;
+  code?: string;
+  display?: string;
+}
+
+export interface FhirCodeableConcept {
+  coding?: FhirCoding[];
+  text?: string;
+}
+
+export interface FhirResource {
+  resourceType: string;
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface FhirBundleEntry {
+  fullUrl?: string;
+  resource: FhirResource;
+}
+
+export interface FhirBundle {
+  resourceType: 'Bundle';
+  type: 'document';
+  id: string;
+  timestamp: string;
+  identifier?: FhirIdentifier;
+  entry: FhirBundleEntry[];
+}
+
 export interface PatientSummaryData {
   meta: {
     version: string;
     created_at_iso: string;
     source: string;
   };
+  fhir_r4_bundle: FhirBundle;
   patient: {
     initials_or_alias: string;
     preferred_language: string;

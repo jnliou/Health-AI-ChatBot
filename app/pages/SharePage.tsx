@@ -8,11 +8,12 @@ import { generateAccessCode } from '../data/mockData';
 import { toast } from 'sonner';
 import { Toaster } from '../components/ui/sonner';
 import { PatientSummaryData } from '../types/patientSummary';
-import { upsertSharedSummaryRecord } from '../utils/sharedSummaryRegistry';
+import { PatientIdentity, upsertSharedSummaryRecord } from '../utils/sharedSummaryRegistry';
 
 const ACCESS_CODE_STORAGE_KEY = 'sia_access_code_v1';
 const ACCESS_CODE_TTL_MS = 1000 * 60 * 60 * 24 * 14; // 14 days
 const SUMMARY_STORAGE_KEY = 'sia_patient_summary_v1';
+const HANDOFF_IDENTITY_STORAGE_KEY = 'sia_handoff_identity_v1';
 
 interface StoredAccessCode {
   code: string;
@@ -27,6 +28,25 @@ export function SharePage() {
   const [hasSummary, setHasSummary] = useState(false);
 
   useEffect(() => {
+    const readIdentity = (): PatientIdentity | undefined => {
+      try {
+        const raw = sessionStorage.getItem(HANDOFF_IDENTITY_STORAGE_KEY);
+        if (!raw) return undefined;
+        const parsed = JSON.parse(raw) as Partial<PatientIdentity>;
+        if (typeof parsed.fullName !== 'string' || typeof parsed.dateOfBirthISO !== 'string') return undefined;
+        if (!parsed.fullName.trim() || !parsed.dateOfBirthISO.trim()) return undefined;
+        return {
+          fullName: parsed.fullName.trim(),
+          dateOfBirthISO: parsed.dateOfBirthISO,
+          consentedAtISO: parsed.consentedAtISO || new Date().toISOString(),
+        };
+      } catch {
+        return undefined;
+      }
+    };
+
+    const identity = readIdentity();
+
     try {
       const raw = localStorage.getItem(ACCESS_CODE_STORAGE_KEY);
       if (raw) {
@@ -42,7 +62,7 @@ export function SharePage() {
             const summaryRaw = sessionStorage.getItem(SUMMARY_STORAGE_KEY);
             if (summaryRaw) {
               const summary = JSON.parse(summaryRaw) as PatientSummaryData;
-              upsertSharedSummaryRecord(parsed.code, parsed.expiresAtISO as string, summary);
+              upsertSharedSummaryRecord(parsed.code, parsed.expiresAtISO as string, summary, identity);
               setHasSummary(true);
             }
           } catch {
@@ -65,7 +85,7 @@ export function SharePage() {
       const summaryRaw = sessionStorage.getItem(SUMMARY_STORAGE_KEY);
       if (summaryRaw) {
         const summary = JSON.parse(summaryRaw) as PatientSummaryData;
-        upsertSharedSummaryRecord(code, expiresAtISOValue, summary);
+        upsertSharedSummaryRecord(code, expiresAtISOValue, summary, identity);
         setHasSummary(true);
       }
     } catch {

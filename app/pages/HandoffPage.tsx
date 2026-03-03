@@ -1,11 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, FileText, Share2, Shield } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
-import { Separator } from '../components/ui/separator';
 import { Checkbox } from '../components/ui/checkbox';
 import { Label } from '../components/ui/label';
+import { Input } from '../components/ui/input';
 import {
   AlertDialog,
   AlertDialogContent,
@@ -17,6 +17,7 @@ import {
 import { PatientSummaryForm } from '../components/PatientSummaryForm';
 import { generatePatientSummary } from '../utils/patientSummaryUtils';
 import { PatientSummaryFormData } from '../types/patientSummary';
+import { buildEmrIntakeNote, SharedSummaryRecord } from '../utils/sharedSummaryRegistry';
 
 export function HandoffPage() {
   const navigate = useNavigate();
@@ -28,14 +29,44 @@ export function HandoffPage() {
     share: false,
     encrypted: false,
   });
+  const [patientFullName, setPatientFullName] = useState('');
+  const [patientDobISO, setPatientDobISO] = useState('');
+  const [summaryPreview, setSummaryPreview] = useState<ReturnType<typeof generatePatientSummary> | null>(null);
 
-  const canProceed = Object.values(consents).every(v => v);
+  const consentComplete = Object.values(consents).every(v => v);
+  const canProceed = consentComplete && patientFullName.trim().length > 1 && !!patientDobISO;
 
   const SUMMARY_STORAGE_KEY = 'sia_patient_summary_v1';
   const SUMMARY_FORM_STORAGE_KEY = 'sia_patient_summary_form_v1';
+  const HANDOFF_IDENTITY_STORAGE_KEY = 'sia_handoff_identity_v1';
+
+  useEffect(() => {
+    try {
+      const identityRaw = sessionStorage.getItem(HANDOFF_IDENTITY_STORAGE_KEY);
+      if (identityRaw) {
+        const parsed = JSON.parse(identityRaw) as { fullName?: string; dateOfBirthISO?: string };
+        if (typeof parsed.fullName === 'string') setPatientFullName(parsed.fullName);
+        if (typeof parsed.dateOfBirthISO === 'string') setPatientDobISO(parsed.dateOfBirthISO);
+      }
+      const summaryRaw = sessionStorage.getItem(SUMMARY_STORAGE_KEY);
+      if (summaryRaw) {
+        setSummaryPreview(JSON.parse(summaryRaw));
+      }
+    } catch {
+      // Ignore malformed storage values.
+    }
+  }, []);
 
   const handleGenerateSummary = () => {
     if (canProceed) {
+      sessionStorage.setItem(
+        HANDOFF_IDENTITY_STORAGE_KEY,
+        JSON.stringify({
+          fullName: patientFullName.trim(),
+          dateOfBirthISO: patientDobISO,
+          consentedAtISO: new Date().toISOString(),
+        })
+      );
       setShowConsentDialog(false);
       setShowTriageForm(true);
     }
@@ -44,24 +75,36 @@ export function HandoffPage() {
   const handleTriageSubmit = (formData: PatientSummaryFormData) => {
     const summary = generatePatientSummary(formData);
     setSavedFormData(formData);
-    localStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(formData));
-    localStorage.setItem(SUMMARY_STORAGE_KEY, JSON.stringify(summary));
+    sessionStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(formData));
+    sessionStorage.setItem(SUMMARY_STORAGE_KEY, JSON.stringify(summary));
+    setSummaryPreview(summary);
     setShowTriageForm(false);
     navigate('/share');
   };
 
-  // Mock FHIR-style summary data
-  const summaryData = {
-    'Chief Concern': 'Routine STI testing / Symptomatic visit',
-    'Symptoms': 'Unusual discharge, mild discomfort',
-    'Onset': '5 days ago',
-    'Sexual History': 'Active, multiple partners in last 6 months',
-    'Recent Exposure': 'Within 2 weeks',
-    'Previous Testing': 'Last tested 6 months ago - negative',
-    'Current Medications': 'None',
-    'Allergies': 'No known drug allergies',
-    'Pregnancy Status': 'Not applicable / Not pregnant',
-  };
+  const handoffPreviewText = useMemo(() => {
+    if (!summaryPreview) {
+      return (
+        'EMR Import - STI Triage Summary (Patient-Provided)\n' +
+        `Patient Name: ${patientFullName.trim() || '[Not provided]'}\n` +
+        `Date of Birth: ${patientDobISO || '[Not provided]'}\n\n` +
+        'Complete triage questions to generate full summary preview.'
+      );
+    }
+
+    const previewRecord: SharedSummaryRecord = {
+      code: 'PREVIEW',
+      expiresAtISO: new Date(Date.now() + (1000 * 60 * 60 * 24 * 14)).toISOString(),
+      sharedAtISO: new Date().toISOString(),
+      summary: summaryPreview,
+      patientIdentity: {
+        fullName: patientFullName.trim(),
+        dateOfBirthISO: patientDobISO,
+      },
+    };
+
+    return buildEmrIntakeNote(previewRecord);
+  }, [summaryPreview, patientDobISO, patientFullName]);
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950">
@@ -104,21 +147,13 @@ export function HandoffPage() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <FileText className="w-5 h-5" />
-              Your Health Summary (Preview)
+              Your Health Summary (Provider View Preview)
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
-            {Object.entries(summaryData).map(([key, value]) => (
-              <div key={key}>
-                <dt className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1">
-                  {key}
-                </dt>
-                <dd className="text-sm text-gray-600 dark:text-gray-400 mb-3">
-                  {value}
-                </dd>
-                <Separator />
-              </div>
-            ))}
+            <pre className="whitespace-pre-wrap text-sm bg-gray-50 dark:bg-gray-800 p-4 rounded-md overflow-auto max-h-[40vh]">
+              {handoffPreviewText}
+            </pre>
           </CardContent>
         </Card>
 
@@ -143,13 +178,46 @@ export function HandoffPage() {
               </li>
               <li className="flex gap-2">
                 <span className="text-red-600">✗</span>
-                <span>Your name or personal identifiers</span>
+                <span>Anything you did not consent to share</span>
               </li>
               <li className="flex gap-2">
                 <span className="text-red-600">✗</span>
                 <span>Your chat messages</span>
               </li>
             </ul>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Patient Identity (Required for Handoff)</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="handoff-full-name">Full name</Label>
+              <Input
+                id="handoff-full-name"
+                value={patientFullName}
+                onChange={(e) => setPatientFullName(e.target.value)}
+                placeholder="Enter patient full name"
+                disabled={!consentComplete}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="handoff-dob">Date of birth</Label>
+              <Input
+                id="handoff-dob"
+                type="date"
+                value={patientDobISO}
+                onChange={(e) => setPatientDobISO(e.target.value)}
+                disabled={!consentComplete}
+              />
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              {consentComplete
+                ? 'Name and DOB will be included in the provider note.'
+                : 'Complete consent checkboxes first, then enter name and date of birth.'}
+            </p>
           </CardContent>
         </Card>
 

@@ -22,7 +22,7 @@ export function TriagePage() {
 
   useEffect(() => {
     try {
-      const stored = localStorage.getItem(TRIAGE_STORAGE_KEY);
+      const stored = sessionStorage.getItem(TRIAGE_STORAGE_KEY);
       if (!stored) return;
       const draft = JSON.parse(stored) as {
         step: number;
@@ -36,7 +36,7 @@ export function TriagePage() {
       setSelectedSymptoms(Array.isArray(draft.selectedSymptoms) ? draft.selectedSymptoms : []);
       setDuration(draft.duration ?? '');
     } catch {
-      // Ignore invalid localStorage values.
+      // Ignore invalid storage values.
     }
   }, []);
 
@@ -48,7 +48,7 @@ export function TriagePage() {
       duration,
       updatedAt: new Date().toISOString(),
     };
-    localStorage.setItem(TRIAGE_STORAGE_KEY, JSON.stringify(payload));
+    sessionStorage.setItem(TRIAGE_STORAGE_KEY, JSON.stringify(payload));
   }, [step, hasSymptoms, selectedSymptoms, duration]);
 
   const symptoms = [

@@ -9,6 +9,7 @@ import { Toaster } from '../components/ui/sonner';
 import { toast } from 'sonner';
 import {
   ProviderEdits,
+  buildEmrIntakeNote,
   getSharedSummaryRecord,
   saveSharedSummaryRecord,
 } from '../utils/sharedSummaryRegistry';
@@ -51,27 +52,7 @@ export function ProviderViewPage() {
 
   const emrNoteText = useMemo(() => {
     if (!record) return '';
-    const s = record.summary;
-    return (
-      `EMR Import - STI Triage Summary (Patient-Provided)\n` +
-      `Access Code: ${record.code}\n` +
-      `Shared: ${new Date(record.sharedAtISO).toLocaleString('en-CA')}\n` +
-      `Reviewed: ${record.reviewedAtISO ? new Date(record.reviewedAtISO).toLocaleString('en-CA') : 'Not yet confirmed'}\n\n` +
-      `CHIEF CONCERN\n${edits.reason_for_visit || s.encounter.reason_for_visit}\n\n` +
-      `ENCOUNTER DETAILS\n` +
-      `- Most recent contact: ${new Date(s.encounter.most_recent_contact_iso).toLocaleString('en-CA')}\n` +
-      `- Sex types: ${s.encounter.sex_types.join(', ') || 'Not provided'}\n` +
-      `- Condom use: ${s.encounter.condom_use}\n\n` +
-      `SYMPTOMS\n` +
-      `- Current symptoms: ${s.symptoms.has_symptoms ? 'Yes' : 'No'}\n` +
-      `- Details: ${edits.symptoms_details || s.symptoms.details.join(', ') || 'None documented'}\n` +
-      `- Duration: ${s.symptoms.duration || 'Not documented'}\n\n` +
-      `EXPOSURE\n` +
-      `- Partner known STI: ${s.exposure.partner_known_sti}\n` +
-      `- Notes: ${edits.exposure_notes || s.exposure.notes || 'None'}\n\n` +
-      `PROVIDER ASSESSMENT\n${edits.provider_assessment || '[Pending provider entry]'}\n\n` +
-      `PLAN\n${edits.provider_plan || '[Pending provider entry]'}\n`
-    );
+    return buildEmrIntakeNote(record, edits);
   }, [record, edits]);
 
   const loadCode = () => {
@@ -174,6 +155,8 @@ export function ProviderViewPage() {
               <CardContent className="space-y-3">
                 <div className="text-sm text-gray-700 dark:text-gray-300">
                   <div>Code: <strong>{record.code}</strong></div>
+                  <div>Patient: {record.patientIdentity?.fullName || 'Not provided'}</div>
+                  <div>DOB: {record.patientIdentity?.dateOfBirthISO ? new Date(record.patientIdentity.dateOfBirthISO).toLocaleDateString('en-CA') : 'Not provided'}</div>
                   <div>Shared: {new Date(record.sharedAtISO).toLocaleString('en-CA')}</div>
                   <div>Expires: {new Date(record.expiresAtISO).toLocaleString('en-CA')}</div>
                   <div>Reviewed: {record.reviewedAtISO ? new Date(record.reviewedAtISO).toLocaleString('en-CA') : 'Not confirmed yet'}</div>
