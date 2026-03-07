@@ -4,6 +4,7 @@ import { Input } from './ui/input';
 import { Checkbox } from './ui/checkbox';
 import { Label } from './ui/label';
 import { PatientSummaryFormData } from '../types/patientSummary';
+import { normalizeDateTimeLocalValue } from '../utils/dateUtils';
 
 interface PatientSummaryFormProps {
   onSubmit: (data: PatientSummaryFormData) => void;
@@ -38,27 +39,34 @@ const DEFAULT_FORM_DATA: PatientSummaryFormData = {
   preferred_language: 'English'
 };
 
+function normalizeFormData(data: PatientSummaryFormData): PatientSummaryFormData {
+  return {
+    ...data,
+    contact_date: normalizeDateTimeLocalValue(data.contact_date),
+  };
+}
+
 export function PatientSummaryForm({ onSubmit, onCancel, initialData }: PatientSummaryFormProps) {
   const [formData, setFormData] = useState<PatientSummaryFormData>({
-    ...DEFAULT_FORM_DATA,
-    ...initialData
+    ...normalizeFormData({
+      ...DEFAULT_FORM_DATA,
+      ...initialData
+    })
   });
   const [shareConsentChecked, setShareConsentChecked] = useState(false);
 
   useEffect(() => {
     if (initialData) {
-      setFormData({
+      setFormData(normalizeFormData({
         ...DEFAULT_FORM_DATA,
         ...initialData,
-      });
+      }));
     }
   }, [initialData]);
 
   useEffect(() => {
     try {
-      const raw =
-        sessionStorage.getItem('sia_triage_draft_v1') ||
-        localStorage.getItem('sia_triage_draft_v1');
+      const raw = sessionStorage.getItem('sia_triage_draft_v1');
       if (!raw) return;
       const draft = JSON.parse(raw) as StoredTriageDraft;
       if (!draft) return;
@@ -74,7 +82,7 @@ export function PatientSummaryForm({ onSubmit, onCancel, initialData }: PatientS
           prev.what_happened ||
           draft.whatHappened ||
           (rememberedSymptoms ? `Symptoms reported in chat: ${rememberedSymptoms}` : prev.what_happened),
-        contact_date: prev.contact_date || draft.contactDate || prev.contact_date,
+        contact_date: normalizeDateTimeLocalValue(draft.contactDate) || prev.contact_date,
         sex_types:
           prev.sex_types.length > 0
             ? prev.sex_types

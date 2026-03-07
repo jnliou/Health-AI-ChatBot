@@ -17,12 +17,23 @@ export function ChatBubble({ role, content, sources }: ChatBubbleProps) {
       const parts = plain.split(urlRegex);
       return parts.map((part, idx) => {
         if (/^https?:\/\/[^\s)]+$/i.test(part)) {
+          let isInternalAppLink = false;
+          try {
+            const parsed = new URL(part);
+            isInternalAppLink =
+              parsed.origin === window.location.origin ||
+              parsed.hostname === 'localhost' ||
+              parsed.hostname === '127.0.0.1';
+          } catch {
+            isInternalAppLink = false;
+          }
+
           return (
             <a
               key={`${keyPrefix}-url-${idx}`}
               href={part}
-              target="_blank"
-              rel="noopener noreferrer"
+              target={isInternalAppLink ? undefined : '_blank'}
+              rel={isInternalAppLink ? undefined : 'noopener noreferrer'}
               className={cn(
                 'underline underline-offset-2',
                 isUser ? 'text-white' : 'text-teal-700 dark:text-teal-300'

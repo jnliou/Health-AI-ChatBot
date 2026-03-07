@@ -1,4 +1,5 @@
 import { FhirBundle, FhirBundleEntry, PatientSummaryData, PatientSummaryFormData } from '../types/patientSummary';
+import { toIsoFromKnownDateValue } from './dateUtils';
 
 function makeId(prefix: string): string {
   const rnd = Math.random().toString(36).slice(2, 10);
@@ -7,9 +8,7 @@ function makeId(prefix: string): string {
 
 function toIsoOrNow(value: string): string {
   if (!value) return new Date().toISOString();
-  const parsed = Date.parse(value);
-  if (Number.isNaN(parsed)) return new Date().toISOString();
-  return new Date(parsed).toISOString();
+  return toIsoFromKnownDateValue(value) || new Date().toISOString();
 }
 
 function splitCsv(value: string): string[] {

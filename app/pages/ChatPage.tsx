@@ -24,6 +24,7 @@ import { PatientSummaryView } from '../components/PatientSummaryView';
 import { generatePatientSummary } from '../utils/patientSummaryUtils';
 import { PatientSummaryFormData, PatientSummaryData } from '../types/patientSummary';
 import { RagChunk, prewarmRagContext, retrieveRagContext } from '../utils/ragRetrieval';
+import { formatDateTimeLocalInput, normalizeDateTimeLocalValue } from '../utils/dateUtils';
 
 // Intent detection types
 type Intent = 
@@ -39,7 +40,6 @@ type TriageStage =
   | 'symptomCheck'
   | 'symptomDetails'
   | 'symptomDuration'
-  | 'contactDate'
   | 'sexTypes'
   | 'condomUse'
   | 'partnerKnownSti'
@@ -172,7 +172,7 @@ const INITIAL_MESSAGE: ChatMessage = {
 
 const SUMMARY_STORAGE_KEY = 'sia_patient_summary_v1';
 const SUMMARY_FORM_STORAGE_KEY = 'sia_patient_summary_form_v1';
-const TRIAGE_DRAFT_STORAGE_KEY = 'sia_triage_draft_v1';
+  const TRIAGE_DRAFT_STORAGE_KEY = 'sia_triage_draft_v1';
 const CHAT_HISTORY_STORAGE_KEY = 'sia_chat_history_v1';
 const ACCESS_CODE_STORAGE_KEY = 'sia_access_code_v1';
 const USER_NAME_STORAGE_KEY = 'sia_user_name_v1';
@@ -1305,22 +1305,38 @@ function parseFlexibleDateInput(input: string): string | null {
   if (!raw) return null;
 
   const now = new Date();
+  const currentYear = now.getFullYear();
   if (lower === 'today') {
-    return new Date(now).toISOString().slice(0, 16);
+    return formatDateTimeLocalInput(new Date(now));
   }
   if (lower === 'yesterday') {
     const d = new Date(now);
     d.setDate(d.getDate() - 1);
-    return d.toISOString().slice(0, 16);
+    return formatDateTimeLocalInput(d);
   }
   if (lower === 'tomorrow') {
     const d = new Date(now);
     d.setDate(d.getDate() + 1);
-    return d.toISOString().slice(0, 16);
+    return formatDateTimeLocalInput(d);
   }
 
   // Accept common separators and optional time.
   const normalized = raw.replace(/\./g, '/').replace(/-/g, '/');
+  const monthDayMatch = normalized.match(/^(\d{1,2})\/(\d{1,2})(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?$/i);
+  if (monthDayMatch) {
+    let hour = monthDayMatch[3] ? Number(monthDayMatch[3]) : 12;
+    const minute = monthDayMatch[4] ? Number(monthDayMatch[4]) : 0;
+    const meridiem = monthDayMatch[5]?.toLowerCase();
+
+    if (meridiem === 'pm' && hour < 12) hour += 12;
+    if (meridiem === 'am' && hour === 12) hour = 0;
+
+    const date = new Date(currentYear, Number(monthDayMatch[1]) - 1, Number(monthDayMatch[2]), hour, minute, 0, 0);
+    if (!Number.isNaN(date.getTime())) {
+      return formatDateTimeLocalInput(date);
+    }
+  }
+
   const match = normalized.match(/^(\d{1,4})\/(\d{1,2})\/(\d{1,4})(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?$/i);
   if (match) {
     let a = Number(match[1]);
@@ -1355,13 +1371,29 @@ function parseFlexibleDateInput(input: string): string | null {
 
     const date = new Date(year, month - 1, day, hour, minute, 0, 0);
     if (!Number.isNaN(date.getTime())) {
-      return date.toISOString().slice(0, 16);
+      return formatDateTimeLocalInput(date);
+    }
+  }
+
+  const monthNameMatch = raw.match(/^([A-Za-z]+)\s+(\d{1,2})(?:,\s*|\s+)?(\d{4})?(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?$/i);
+  if (monthNameMatch) {
+    const inferredYear = monthNameMatch[3] ? Number(monthNameMatch[3]) : currentYear;
+    let hour = monthNameMatch[4] ? Number(monthNameMatch[4]) : 12;
+    const minute = monthNameMatch[5] ? Number(monthNameMatch[5]) : 0;
+    const meridiem = monthNameMatch[6]?.toLowerCase();
+
+    if (meridiem === 'pm' && hour < 12) hour += 12;
+    if (meridiem === 'am' && hour === 12) hour = 0;
+
+    const date = new Date(`${monthNameMatch[1]} ${monthNameMatch[2]} ${inferredYear} ${hour}:${String(minute).padStart(2, '0')}`);
+    if (!Number.isNaN(date.getTime())) {
+      return formatDateTimeLocalInput(date);
     }
   }
 
   const parsedMs = Date.parse(raw);
   if (!Number.isNaN(parsedMs)) {
-    return new Date(parsedMs).toISOString().slice(0, 16);
+    return formatDateTimeLocalInput(new Date(parsedMs));
   }
   return null;
 }
@@ -1377,7 +1409,7 @@ function parseRelativeAgoDateInput(input: string): string | null {
   if (unit.startsWith('day')) d.setDate(d.getDate() - value);
   if (unit.startsWith('week')) d.setDate(d.getDate() - (value * 7));
   if (unit.startsWith('month')) d.setMonth(d.getMonth() - value);
-  return d.toISOString().slice(0, 16);
+  return formatDateTimeLocalInput(d);
 }
 
 export function ChatPage() {
@@ -1439,6 +1471,23 @@ export function ChatPage() {
         ...updates,
       };
       sessionStorage.setItem(TRIAGE_DRAFT_STORAGE_KEY, JSON.stringify(merged));
+
+      const shouldRefreshSummaryDraft =
+        updates.whatHappened !== undefined ||
+        updates.sexTypes !== undefined ||
+        updates.condomUse !== undefined ||
+        updates.partnerKnownSti !== undefined ||
+        updates.hasSymptoms !== undefined ||
+        updates.selectedSymptoms !== undefined ||
+        updates.duration !== undefined;
+
+      if (shouldRefreshSummaryDraft) {
+        const nextPrefill = buildSummaryPrefill();
+        setSummaryFormData(nextPrefill);
+        sessionStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(nextPrefill));
+        setSummaryData(null);
+        sessionStorage.removeItem(SUMMARY_STORAGE_KEY);
+      }
     } catch {
       // Ignore storage failures and continue chat flow.
     }
@@ -1449,6 +1498,7 @@ export function ChatPage() {
       ...EMPTY_SUMMARY_FORM_DATA,
       ...(summaryFormData || {}),
     };
+    base.contact_date = normalizeDateTimeLocalValue(base.contact_date);
 
     try {
       const raw = sessionStorage.getItem(TRIAGE_DRAFT_STORAGE_KEY);
@@ -1457,7 +1507,7 @@ export function ChatPage() {
       return {
         ...base,
         what_happened: base.what_happened || (triage.whatHappened || ''),
-        contact_date: base.contact_date || (triage.contactDate || ''),
+        contact_date: base.contact_date,
         sex_types: base.sex_types.length > 0 ? base.sex_types : (Array.isArray(triage.sexTypes) ? triage.sexTypes : []),
         condom_use:
           base.condom_use !== EMPTY_SUMMARY_FORM_DATA.condom_use
@@ -1538,6 +1588,10 @@ export function ChatPage() {
   }, [messages]);
 
   useEffect(() => {
+    if (import.meta.env.DEV) {
+      return;
+    }
+
     let cancelled = false;
 
     const runPrewarm = async (force = false) => {
@@ -1577,9 +1631,6 @@ export function ChatPage() {
     const latestAssistantContent = [...messages]
       .reverse()
       .find((m) => m.role === 'assistant')?.content || '';
-    const triagePromptHasChoices =
-      latestAssistantContent.includes('Type **"open clinics"**') &&
-      latestAssistantContent.includes('Type **"use this for my note"**');
     const asymptomaticQuickChoicePrompt =
       latestAssistantContent.includes('Type **"GetCheckedOnline"**') &&
       latestAssistantContent.includes('Type **"open clinics"**');
@@ -1601,30 +1652,26 @@ export function ChatPage() {
     const wantsOptionThree =
       normalizedNumericInput === '3' || normalizedNumericInput === '3.' || normalizedNumericInput === 'option 3';
     const normalizedCommandInput =
-      triagePromptHasChoices && wantsOptionOne
-        ? 'open clinics'
-        : triagePromptHasChoices && wantsOptionTwo
-          ? 'use this for my note'
-          : asymptomaticQuickChoicePrompt && wantsOptionOne
+      asymptomaticQuickChoicePrompt && wantsOptionOne
             ? 'getcheckedonline'
             : asymptomaticQuickChoicePrompt && wantsOptionTwo
               ? 'open clinics'
               : directClinicOrNotePrompt && wantsOptionOne
                 ? 'open clinics'
                 : directClinicOrNotePrompt && wantsOptionTwo
-                  ? 'use this for my note'
+                  ? 'open clinics'
                   : noSymptomThreeChoicePrompt && wantsOptionOne
                     ? 'getcheckedonline'
                     : noSymptomThreeChoicePrompt && wantsOptionTwo
                       ? 'open clinics'
                       : noSymptomThreeChoicePrompt && wantsOptionThree
-                        ? 'use this for my note'
+                        ? 'open clinics'
               : legacyNoSymptomPrompt && wantsOptionOne
                 ? 'getcheckedonline'
                 : legacyNoSymptomPrompt && wantsOptionTwo
                   ? 'find a clinic'
                   : legacyNoSymptomPrompt && wantsOptionThree
-                    ? 'use this for my note'
+                    ? 'find a clinic'
                     : currentInput;
 
     const userMessage: ChatMessage = {
@@ -1913,8 +1960,8 @@ export function ChatPage() {
         setTriageStage('whatHappened');
         return {
           content:
-            'Thank you. I will ask **5 quick questions** to prefill a note you can choose to share with a provider.\n\n' +
-            '**Quick 1/5:** One-line reason for visit (for the note)\n' +
+            'Thank you. I will ask **4 quick questions** to prefill a note you can choose to share with a provider.\n\n' +
+            '**Quick 1/4:** One-line reason for visit (for the note)\n' +
             'Example: "New partner, condom broke, now burning when peeing".\n' +
             'You can type **skip**.',
           sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
@@ -1932,7 +1979,7 @@ export function ChatPage() {
             'No problem. I will not ask the provider-share questions.\n\n' +
             (wasAsymptomatic
               ? '**Next steps:**\n1. Type **"GetCheckedOnline"** for online testing.\n2. Type **"open clinics"** for in-person care.'
-              : '**Next steps:**\n1. Type **"open clinics"** to find nearby in-person care.\n2. Type **"use this for my note"** if you want to create a shareable note later.'),
+              : '**Next steps:**\n1. Type **"open clinics"** to find nearby in-person care.'),
           sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
         };
       }
@@ -2391,7 +2438,7 @@ export function ChatPage() {
           '- Drink fluids and avoid irritants in the genital area\n' +
           '- Do not self-start old antibiotics\n' +
           '- Go to urgent care now for severe pain, fever, or swelling\n\n' +
-          'Would you like me to ask **5 quick triage questions** to prefill a note you can choose to share with your provider?\n\n' +
+          'Would you like me to ask **4 quick triage questions** to prefill a note you can choose to share with your provider?\n\n' +
           'Reply **"yes"** or **"no"**.',
         sources: [
           {
@@ -2399,40 +2446,6 @@ export function ChatPage() {
             url: 'https://smartsexresource.com/clinics-testing/',
           },
         ],
-      };
-    }
-
-    if (triageStage === 'contactDate') {
-      const skipRequested = lowerQuery === 'skip' || lowerQuery === 'n/a' || lowerQuery === 'na';
-      if (skipRequested) {
-        persistTriageDraft({ contactDate: '' });
-        setTriageStage('sexTypes');
-        return {
-          content:
-            '**Quick 3/5:** Types of sex during that contact?\n' +
-            'Options: oral, vaginal, anal, other.\n' +
-            'You can list multiple or type **skip**.',
-          sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
-        };
-      }
-
-      const parsedDate = parseFlexibleDateInput(query);
-      if (!parsedDate) {
-        return {
-          content:
-            'I could not read that date/time. Try formats like `2026-03-01 14:30`, `March 1 2026`, `03/01/2026`, or `yesterday`. You can also type **skip**.',
-          sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
-        };
-      }
-
-      persistTriageDraft({ contactDate: parsedDate });
-      setTriageStage('sexTypes');
-      return {
-        content:
-          '**Quick 3/5:** Types of sex during that contact?\n' +
-          'Options: oral, vaginal, anal, other.\n' +
-          'You can list multiple or type **skip**.',
-        sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
       };
     }
 
@@ -2452,7 +2465,7 @@ export function ChatPage() {
       setTriageStage('condomUse');
       return {
         content:
-          '**Quick 4/5:** Condom use?\n' +
+          '**Quick 3/4:** Condom use?\n' +
           '1. used throughout\n' +
           '2. used sometimes\n' +
           '3. no condom\n' +
@@ -2477,7 +2490,7 @@ export function ChatPage() {
 
       setTriageStage('partnerKnownSti');
       return {
-        content: '**Quick 5/5:** Any partner with a known STI or recent positive test? Reply **yes**, **no**, or **unsure**. You can type **skip**.',
+        content: '**Quick 4/4:** Any partner with a known STI or recent positive test? Reply **yes**, **no**, or **unsure**. You can type **skip**.',
         sources: [{ label: 'SmartSexResource - Partner Notification', url: 'https://smartsexresource.com/sexually-transmitted-infections/partner-notification/' }],
       };
     }
@@ -2513,7 +2526,7 @@ export function ChatPage() {
         what_happened:
           savedDraft?.whatHappened ||
           (savedDraft?.hasSymptoms === 'yes' ? 'Symptoms requiring in-person STI assessment' : 'Recent STI exposure concern'),
-        contact_date: savedDraft?.contactDate || '',
+        contact_date: '',
         sex_types: savedDraft?.sexTypes || [],
         condom_use: savedDraft?.condomUse || 'no condom',
         has_symptoms: savedDraft?.hasSymptoms === 'yes',
@@ -2537,8 +2550,10 @@ export function ChatPage() {
         content:
           '**Thanks - I prefilled more of your triage form.**\n\n' +
           '**Next steps:**\n' +
-          '1. Type **"open clinics"** to see nearby clinics now.\n' +
-          '2. Type **"use this for my note"** to open your prefilled patient summary note.',
+          '1. **Clinics Near You:** http://localhost:5173/clinics?from=chat&autoLocate=1\n' +
+          '2. Choose the clinic that fits your needs.\n' +
+          '3. After selecting a clinic, you can generate and review a patient summary note to share with clinicians.\n\n' +
+          'I recommend opening the clinic list now so you can compare your options.',
         sources: [
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' },
         ],
@@ -2550,11 +2565,12 @@ export function ChatPage() {
       if (!skipRequested && query.trim()) {
         persistTriageDraft({ whatHappened: query.trim().slice(0, 220) });
       }
-      setTriageStage('contactDate');
+      setTriageStage('sexTypes');
       return {
         content:
-          '**Quick 2/5:** When was the most recent sexual contact that concerns you?\n' +
-          'You can enter a date/time (for example: `2026-03-01 14:30`, `March 1 2026`, `yesterday`) or type **skip**.',
+          '**Quick 2/4:** Types of sex during that contact?\n' +
+          'Options: oral, vaginal, anal, other.\n' +
+          'You can list multiple or type **skip**.',
         sources: [{ label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }],
       };
     }
@@ -2644,13 +2660,9 @@ export function ChatPage() {
     }
 
     if (lowerQuery.includes('use this for my note') || lowerQuery.includes('use this note')) {
-      setSummaryChatStage('idle');
-      setAwaitingSummaryConsent(true);
       return {
         content:
-          '**Before we continue, do you consent to create a patient summary note for clinic sharing?**\n\n' +
-          'You can review and edit all details before sharing.\n\n' +
-          'Reply **"yes"** to continue or **"no"** to cancel.',
+          'This chatbot flow is focused on helping you find the best clinic option.\n\nType **"open clinics"** to see nearby in-person care, or **"GetCheckedOnline"** if you want online testing guidance.',
         sources: [
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }
         ],
@@ -2941,13 +2953,9 @@ export function ChatPage() {
         lowerQuery.includes('something for the nurse') ||
         lowerQuery.includes('something for the doctor') ||
         lowerQuery.includes('patient summary')) {
-      setSummaryChatStage('idle');
-      setAwaitingSummaryConsent(true);
       return {
         content:
-          '**Before we continue, do you consent to create a patient summary note for clinic sharing?**\n\n' +
-          'If you say yes, I will collect the details in a quick chat Q&A and generate the note for your review.\n\n' +
-          'Reply **"yes"** to continue or **"no"** to cancel.',
+          'I can help you figure out the best clinic option for your situation.\n\nType **"open clinics"** to find nearby in-person care, or **"GetCheckedOnline"** if you want online testing guidance.',
         sources: [
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }
         ]
@@ -2974,7 +2982,7 @@ export function ChatPage() {
         lowerQuery.includes('discharge') || lowerQuery.includes('sore') || lowerQuery.includes('bump') ||
         lowerQuery.includes('rash') || lowerQuery.includes('itch')) {
       return {
-        content: `**Thanks for telling me.**\n\nPain when peeing can be an STI symptom.\n\nBC CDC recommends an **in-person assessment** instead of GetCheckedOnline when symptoms are present.\n\nWould you like me to:\n\n1. **Show the closest clinics**, or\n2. **Create a patient summary note** you can show at the clinic?`,
+        content: `**Thanks for telling me.**\n\nPain when peeing can be an STI symptom.\n\nBC CDC recommends an **in-person assessment** instead of GetCheckedOnline when symptoms are present.\n\nType **"open clinics"** and I can help you look at clinic options near you.`,
         sources: [
           { label: 'Pathways BC - Sexual Health Clinics', url: 'https://vancouver.pathwaysbc.ca/programs/1286' },
           { label: 'SmartSexResource - Clinics & Testing', url: 'https://smartsexresource.com/clinics-testing/' }
@@ -2987,7 +2995,7 @@ export function ChatPage() {
          lowerQuery === "don't think so" || lowerQuery === "i don't think so" || lowerQuery === "not really") &&
         messages.length > 2) { // Only if in conversation context
       return {
-        content: `**Okay - since you don't have symptoms, GetCheckedOnline can be a good option.**\n\nYou create a lab form online and visit a participating LifeLabs for samples.\n\n**How often to test (general):**\n- Usually every **3-12 months**\n- If you/partners have new or casual partners, every **3-6 months** is common\n- Testing monthly is usually not recommended\n\n**After a specific exposure:** testing is often done around **3 weeks** and again at **3 months**.\n\nWould you like to:\n\n1. **Start with GetCheckedOnline**\n2. **Find a nearby clinic**\n3. **Create a patient summary note**`,
+        content: `**Okay - since you don't have symptoms, GetCheckedOnline can be a good option.**\n\nYou create a lab form online and visit a participating LifeLabs for samples.\n\n**How often to test (general):**\n- Usually every **3-12 months**\n- If you/partners have new or casual partners, every **3-6 months** is common\n- Testing monthly is usually not recommended\n\n**After a specific exposure:** testing is often done around **3 weeks** and again at **3 months**.\n\nWould you like to:\n\n1. **Start with GetCheckedOnline**\n2. **Find a nearby clinic**`,
         sources: [
           { label: 'GetCheckedOnline', url: 'https://getcheckedonline.com' },
           { label: 'SmartSexResource - Testing', url: 'https://smartsexresource.com/testing/' },
@@ -3710,6 +3718,9 @@ export function ChatPage() {
   };
 
   const handleSummaryEdit = () => {
+    const prefill = buildSummaryPrefill();
+    setSummaryFormData(prefill);
+    sessionStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(prefill));
     setShowSummaryView(false);
     setShowSummaryForm(true);
   };
@@ -3719,9 +3730,11 @@ export function ChatPage() {
   };
 
   const handleStartNewSummary = () => {
-    setSummaryFormData(null);
+    const prefill = buildSummaryPrefill();
+    setSummaryFormData(prefill);
     setSummaryData(null);
-    sessionStorage.removeItem(SUMMARY_FORM_STORAGE_KEY);
+    localStorage.removeItem(TRIAGE_DRAFT_STORAGE_KEY);
+    sessionStorage.setItem(SUMMARY_FORM_STORAGE_KEY, JSON.stringify(prefill));
     sessionStorage.removeItem(SUMMARY_STORAGE_KEY);
     localStorage.removeItem(ACCESS_CODE_STORAGE_KEY);
     setShowSummaryView(false);

@@ -1,4 +1,5 @@
 import { PatientSummaryData } from '../types/patientSummary';
+import { formatDateOnlyDisplay, formatDateTimeDisplay } from './dateUtils';
 
 export const SHARED_SUMMARY_REGISTRY_KEY = 'sia_shared_summaries_v1';
 
@@ -86,9 +87,7 @@ export function buildEmrIntakeNote(record: SharedSummaryRecord, edits?: Provider
   const s = record.summary;
   const e = edits || record.providerEdits;
   const patientName = record.patientIdentity?.fullName || '[Not provided]';
-  const patientDob = record.patientIdentity?.dateOfBirthISO
-    ? new Date(record.patientIdentity.dateOfBirthISO).toLocaleDateString('en-CA')
-    : '[Not provided]';
+  const patientDob = formatDateOnlyDisplay(record.patientIdentity?.dateOfBirthISO);
   const bundleId = s.fhir_r4_bundle?.id || '[Not available]';
   const compositionEntry = s.fhir_r4_bundle?.entry?.find((x) => x.resource.resourceType === 'Composition');
   const compositionId = compositionEntry?.resource?.id || '[Not available]';
@@ -100,11 +99,11 @@ export function buildEmrIntakeNote(record: SharedSummaryRecord, edits?: Provider
     `Access Code: ${record.code}\n` +
     `Patient Name: ${patientName}\n` +
     `Date of Birth: ${patientDob}\n` +
-    `Shared: ${new Date(record.sharedAtISO).toLocaleString('en-CA')}\n` +
-    `Reviewed: ${record.reviewedAtISO ? new Date(record.reviewedAtISO).toLocaleString('en-CA') : 'Not yet confirmed'}\n\n` +
+    `Shared: ${formatDateTimeDisplay(record.sharedAtISO)}\n` +
+    `Reviewed: ${record.reviewedAtISO ? formatDateTimeDisplay(record.reviewedAtISO) : 'Not yet confirmed'}\n\n` +
     `SECTION: CHIEF CONCERN\n${e?.reason_for_visit || s.encounter.reason_for_visit}\n\n` +
     `SECTION: ENCOUNTER\n` +
-    `- Most recent contact: ${new Date(s.encounter.most_recent_contact_iso).toLocaleString('en-CA')}\n` +
+    `- Most recent contact: ${formatDateTimeDisplay(s.encounter.most_recent_contact_iso)}\n` +
     `- Sex types: ${s.encounter.sex_types.join(', ') || 'Not provided'}\n` +
     `- Condom use: ${s.encounter.condom_use}\n\n` +
     `SECTION: SYMPTOMS\n` +
@@ -115,8 +114,6 @@ export function buildEmrIntakeNote(record: SharedSummaryRecord, edits?: Provider
     `- Partner known STI: ${s.exposure.partner_known_sti}\n` +
     `- Notes: ${e?.exposure_notes || s.exposure.notes || 'None'}\n\n` +
     `SECTION: PROVIDER ASSESSMENT\n${e?.provider_assessment || '[Pending provider entry]'}\n\n` +
-    `SECTION: PLAN\n${e?.provider_plan || '[Pending provider entry]'}\n\n` +
-    `FHIR RESOURCES INCLUDED\n` +
-    `${(s.fhir_r4_bundle?.entry || []).map((entry) => `- ${entry.resource.resourceType}/${entry.resource.id}`).join('\n') || '- [Not available]'}\n`
+    `SECTION: PLAN\n${e?.provider_plan || '[Pending provider entry]'}\n`
   );
 }

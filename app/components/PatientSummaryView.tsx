@@ -54,7 +54,7 @@ export function PatientSummaryView({ data, onEdit, onClose, onFindClinic, onGetA
       <div className="bg-[#003366] text-white px-6 py-4 rounded-t-lg">
         <h3 className="text-xl font-semibold">Your Patient Summary</h3>
         <p className="text-sm text-white/80 mt-1">
-          FHIR R4-aligned summary preview shared with clinic/provider.
+          Review the summary you can share with your clinic or provider.
         </p>
       </div>
 

@@ -13,6 +13,7 @@ import {
   getSharedSummaryRecord,
   saveSharedSummaryRecord,
 } from '../utils/sharedSummaryRegistry';
+import { formatDateOnlyDisplay, formatDateTimeDisplay } from '../utils/dateUtils';
 
 function buildProviderEditsFromSummary(code: string): ProviderEdits {
   const record = getSharedSummaryRecord(code);
@@ -156,10 +157,10 @@ export function ProviderViewPage() {
                 <div className="text-sm text-gray-700 dark:text-gray-300">
                   <div>Code: <strong>{record.code}</strong></div>
                   <div>Patient: {record.patientIdentity?.fullName || 'Not provided'}</div>
-                  <div>DOB: {record.patientIdentity?.dateOfBirthISO ? new Date(record.patientIdentity.dateOfBirthISO).toLocaleDateString('en-CA') : 'Not provided'}</div>
-                  <div>Shared: {new Date(record.sharedAtISO).toLocaleString('en-CA')}</div>
-                  <div>Expires: {new Date(record.expiresAtISO).toLocaleString('en-CA')}</div>
-                  <div>Reviewed: {record.reviewedAtISO ? new Date(record.reviewedAtISO).toLocaleString('en-CA') : 'Not confirmed yet'}</div>
+                  <div>DOB: {formatDateOnlyDisplay(record.patientIdentity?.dateOfBirthISO)}</div>
+                  <div>Shared: {formatDateTimeDisplay(record.sharedAtISO)}</div>
+                  <div>Expires: {formatDateTimeDisplay(record.expiresAtISO)}</div>
+                  <div>Reviewed: {record.reviewedAtISO ? formatDateTimeDisplay(record.reviewedAtISO) : 'Not confirmed yet'}</div>
                 </div>
                 <div className="flex items-center gap-2">
                   <input

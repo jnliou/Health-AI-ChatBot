@@ -48,6 +48,10 @@ export function HandoffPage() {
         if (typeof parsed.fullName === 'string') setPatientFullName(parsed.fullName);
         if (typeof parsed.dateOfBirthISO === 'string') setPatientDobISO(parsed.dateOfBirthISO);
       }
+      const formRaw = sessionStorage.getItem(SUMMARY_FORM_STORAGE_KEY);
+      if (formRaw) {
+        setSavedFormData(JSON.parse(formRaw) as PatientSummaryFormData);
+      }
       const summaryRaw = sessionStorage.getItem(SUMMARY_STORAGE_KEY);
       if (summaryRaw) {
         setSummaryPreview(JSON.parse(summaryRaw));
@@ -296,7 +300,7 @@ export function HandoffPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>Continue to Triage Questions?</AlertDialogTitle>
             <AlertDialogDescription>
-              Next, you'll answer standard STI triage questions to create a clearer clinic summary. After that, we will generate your secure 6-character code and QR.
+              Next, you'll answer standard STI triage questions to create a clearer clinic summary. After that, we will generate your secure 6-character access code.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
