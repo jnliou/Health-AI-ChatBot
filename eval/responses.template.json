@@ -1,0 +1,32 @@
+﻿[
+  {
+    "id": "bc_types_1",
+    "prompt": "What types of contraceptives are there?",
+    "response": "",
+    "sources": []
+  },
+  {
+    "id": "bc_types_2",
+    "prompt": "What types of birth control are there?",
+    "response": "",
+    "sources": []
+  },
+  {
+    "id": "bc_start_1",
+    "prompt": "When can I start taking birth control?",
+    "response": "",
+    "sources": []
+  },
+  {
+    "id": "bc_effective_1",
+    "prompt": "How effective is the birth control pill?",
+    "response": "",
+    "sources": []
+  },
+  {
+    "id": "bc_emergency_1",
+    "prompt": "Condom broke last night, what should I do?",
+    "response": "",
+    "sources": []
+  }
+]

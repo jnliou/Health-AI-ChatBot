@@ -8,6 +8,7 @@ import { ClinicDetailPage } from "./pages/ClinicDetailPage";
 import { HandoffPage } from "./pages/HandoffPage";
 import { SharePage } from "./pages/SharePage";
 import { PrivacyPage } from "./pages/PrivacyPage";
+import { ProviderViewPage } from "./pages/ProviderViewPage";
 
 export const router = createBrowserRouter([
   {
@@ -41,6 +42,14 @@ export const router = createBrowserRouter([
   {
     path: "/share",
     Component: SharePage,
+  },
+  {
+    path: "/provider",
+    Component: ProviderViewPage,
+  },
+  {
+    path: "/view/:code",
+    Component: ProviderViewPage,
   },
   {
     path: "/privacy",

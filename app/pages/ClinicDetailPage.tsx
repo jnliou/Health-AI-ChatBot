@@ -150,7 +150,7 @@ export function ClinicDetailPage() {
             size="lg"
             onClick={() => navigate('/handoff')}
           >
-            Select This Clinic
+            Select This Clinic and Create Summary
           </Button>
 
           <Button

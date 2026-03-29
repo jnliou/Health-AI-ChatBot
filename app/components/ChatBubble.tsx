@@ -12,13 +12,48 @@ export function ChatBubble({ role, content, sources }: ChatBubbleProps) {
 
   // Convert markdown bold (**text**) to HTML
   const formatContent = (text: string) => {
+    const renderLinkifiedText = (plain: string, keyPrefix: string) => {
+      const urlRegex = /(https?:\/\/[^\s)]+)/g;
+      const parts = plain.split(urlRegex);
+      return parts.map((part, idx) => {
+        if (/^https?:\/\/[^\s)]+$/i.test(part)) {
+          let isInternalAppLink = false;
+          try {
+            const parsed = new URL(part);
+            isInternalAppLink =
+              parsed.origin === window.location.origin ||
+              parsed.hostname === 'localhost' ||
+              parsed.hostname === '127.0.0.1';
+          } catch {
+            isInternalAppLink = false;
+          }
+
+          return (
+            <a
+              key={`${keyPrefix}-url-${idx}`}
+              href={part}
+              target={isInternalAppLink ? undefined : '_blank'}
+              rel={isInternalAppLink ? undefined : 'noopener noreferrer'}
+              className={cn(
+                'underline underline-offset-2',
+                isUser ? 'text-white' : 'text-teal-700 dark:text-teal-300'
+              )}
+            >
+              {part}
+            </a>
+          );
+        }
+        return <span key={`${keyPrefix}-txt-${idx}`}>{part}</span>;
+      });
+    };
+
     const parts = text.split(/(\*\*.*?\*\*)/g);
     return parts.map((part, idx) => {
       if (part.startsWith('**') && part.endsWith('**')) {
         const boldText = part.slice(2, -2);
-        return <strong key={idx}>{boldText}</strong>;
+        return <strong key={idx}>{renderLinkifiedText(boldText, `b-${idx}`)}</strong>;
       }
-      return <span key={idx}>{part}</span>;
+      return <span key={idx}>{renderLinkifiedText(part, `p-${idx}`)}</span>;
     });
   };
 

@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "eval:init": "node scripts/eval-init.mjs",
+    "eval:chat": "node scripts/eval-chat-responses.mjs --prompts eval/prompts.contraception.json --responses eval/responses.latest.json",
+    "test:chat-logic": "node scripts/regression-chat-rules.mjs"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
